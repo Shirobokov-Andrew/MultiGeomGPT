@@ -1,4 +1,3 @@
-# model.py
 import math
 import torch
 import torch.nn as nn
@@ -71,6 +70,17 @@ def custom_attention(
         attn_weight = dropout(attn_weight)
     # attn_weight = F.dropout(attn_weight, p=dropout_p, training=training)
     return attn_weight @ value
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        norm = torch.norm(x, p=2, dim=-1, keepdim=True) * (x.size(-1) ** -0.5)
+        return x / (norm + self.eps) * self.weight
 
 
 class MultiGeometryAttention(nn.Module):
@@ -151,17 +161,6 @@ class MultiGeometryAttention(nn.Module):
         return self.resid_dropout(self.proj(x))
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        norm = torch.norm(x, p=2, dim=-1, keepdim=True) * (x.size(-1) ** -0.5)
-        return x / (norm + self.eps) * self.weight
-
-
 class MultiGeometryBlock(nn.Module):
     def __init__(self, config: MultiGeomGPTConfig):
         super().__init__()
@@ -183,202 +182,162 @@ class MultiGeometryBlock(nn.Module):
         return x
 
 
-class SphericalBlock(nn.Module):
-    def __init__(self, config: MultiGeomGPTConfig):
+class JointGeometryMLP(nn.Module):
+    def __init__(self, config: MultiGeomGPTConfig, geom_type: str):
+        """
+        :param geom_type: geometry type - can be euc, hyp or sph
+        """
         super().__init__()
+        self.geom_type = geom_type
+        self.n_embd = config.n_embd
 
+        self.uv_proj = nn.Linear(self.n_embd, 2 * 4 * self.n_embd, bias=False)
+        self.act = nn.SiLU()
+        self.out_proj = nn.Linear(4 * self.n_embd, self.n_embd, bias=False)
+
+        if geom_type == "sph":
+            self._init_spherical_params()
+
+    def _init_spherical_params(self):
+        self.init_value = 1.0
+        self.init_scaling = 1.0
+        self.suv = nn.Parameter(self.init_scaling * torch.ones(2 * 4 * self.n_embd, dtype=torch.float32))
+    
+    def forward(self, x: torch.Tensor):
+        uv = self.uv_proj(x)
+        if self.geom_type == "sph":
+            scaling = (self.init_value / self.init_scaling) * (self.n_embd ** 0.5)
+            uv = self.suv * scaling * uv
+
+        u, v = torch.chunk(uv, 2, dim=-1)
+        h = u * self.act(v)
+        h = self.out_proj(h)
+
+        return h
+
+
+class JointGeometryAttention(nn.Module):
+    def __init__(self, config: MultiGeomGPTConfig, geom_type: str):
+        """
+        :param geom_type: geometry type - can be euc, hyp or sph
+        """
+        super().__init__()
+        self.config = config
+        self.geom_type = geom_type
         self.n_heads = config.n_heads
         self.head_dim = config.head_dim
         self.n_embd = config.n_embd
 
-        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.attn_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+        self.qkv = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
+        self.out_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.rotary = Rotary(self.head_dim)
-        
-        self.mlp_uv_proj = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
-        self.silu = nn.SiLU()
-        self.mlp_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
-        # below are spherical specific parameters
+        if geom_type == "hyp":
+            self._init_hyperbolic_params()
+        elif geom_type == "sph":
+            self._init_spherical_params()
+
+    def _init_hyperbolic_params(self):
+        if self.config.attn_k_lr:
+            x = torch.randn(1, self.n_heads, 1, 1, device=self.qkv.weight.device)
+            init_k = torch.exp(x) * self.config.curvature
+            self.hyp_curvature = nn.Parameter(init_k)
+        else:
+            self.register_buffer('hyp_curvature', torch.full((1, self.n_heads, 1, 1), self.config.curvature))
+    
+    def _init_spherical_params(self):
+        self.sqk_init_value = 1.0
+        self.sqk_init_scaling = 1.0 / (self.n_embd ** 0.5)
+        self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
+
+    def forward(self, x: torch.Tensor):
+        B, T, C = x.size()
+        qkv = self.qkv(x).split(C, dim=2)
+        q, k, v = [t.view(B, T, self.n_heads, self.head_dim) for t in qkv]
+
+        cos, sin = self.rotary(q)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        if self.geom_type == "euc":
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=1 / (self.n_embd ** 0.5))
+        elif self.geom_type == "hyp":
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="hyp", curvature=self.hyp_curvature)
+        elif self.geom_type == "sph":
+            sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.n_heads, self.head_dim)
+            q = sqk * F.normalize(q, p=2.0, dim=-1)
+            k = sqk * F.normalize(k, p=2.0, dim=-1)
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=self.n_embd ** 0.5)
+
+        attn = attn.transpose(1, 2).contiguous().view(B, T, C)
+
+        return self.out_proj(attn)
+
+
+class JointGeometryBlock(nn.Module):
+    def __init__(self, config: MultiGeomGPTConfig, geom_type: str):
+        """
+        :param geom_type: geometry type - can be euc, hyp or sph
+        """
+        super().__init__()
+        assert geom_type in ["sph", "hyp", "euc"], f"Unknown geometry was given: {geom_type}"
+
+        self.geom_type = geom_type
+        self.n_embd = config.n_embd
+
+        self.attn = JointGeometryAttention(config, geom_type)
+        self.mlp = JointGeometryMLP(config, geom_type)
+
+        if geom_type == "sph":
+            self._init_spherical_params()
+
+    def _init_spherical_params(self):
         self.attn_alpha_init_value = 0.05
-        self.attn_alpha_init_scaling = 1.0 / (config.n_embd ** 0.5)
-        self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
+        self.attn_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
+        self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
 
         self.mlp_alpha_init_value = 0.05
-        self.mlp_alpha_init_scaling = 1.0 / (config.n_embd ** 0.5)
-        self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
-
-        self.sqk_init_value = 1.0       
-        self.sqk_init_scaling = 1.0 / (config.n_embd ** 0.5)
-        self.sqk = torch.nn.Parameter(self.sqk_init_scaling * torch.ones(config.n_embd, dtype=torch.float32))
-
-        self.suv_init_value = 1.0
-        self.suv_init_scaling = 1.0
-        self.suv = torch.nn.Parameter(self.suv_init_scaling * torch.ones(2 * 4 * config.n_embd, dtype=torch.float32))
-    
+        self.mlp_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
+        self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
-        B, T, C = x.size()
-        h = x
+        if self.geom_type in ["euc", "hyp"]:
+            h = F.rms_norm(x, (x.size(-1),))
+        else:
+            h = x
 
-        qkv = self.qkv(h).split(C, dim=2)
-        q, k, v = [x.view(B, T, self.n_heads, self.head_dim) for x in qkv]
+        h_attn = self.attn(h)
 
-        cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        if self.geom_type == "sph":
+            x = self._sph_skip_connection(x, h_attn, "attn")
+        else:
+            x = x + h_attn
 
-        sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.n_heads, self.head_dim)
-        q = sqk * F.normalize(q, p=2.0, dim=-1)
-        k = sqk * F.normalize(k, p=2.0, dim=-1)
-        attn = custom_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            scale=self.n_embd ** 0.5,
-        ).transpose(1, 2).contiguous().view(B, T, C)
-        h_attn = self.attn_proj(attn)
-        
-        # spherical attn skip connection via linearized SLERP
-        x = self.sph_skip_connection(x, h_attn, "attn")
+        if self.geom_type in ["euc", "hyp"]:
+            h = F.rms_norm(x, (x.size(-1),))
+        else:
+            h = x
 
-        h = x
-        # SwiGLU mlp
-        uv = self.mlp_uv_proj(h)
-        suv = (self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.n_embd ** 0.5)))
-        uv = suv * uv 
-        u, v = torch.chunk(uv, 2, dim=-1)
-        h_mlp = u * self.silu(v)
-        h_mlp = self.mlp_proj(h_mlp)
+        h_mlp = self.mlp(h)
 
-        # spherical mlp skip connection via linearized SLERP
-        x = self.sph_skip_connection(x, h_mlp, "mlp")
+        if self.geom_type == "sph":
+            x = self._sph_skip_connection(x, h_mlp, "mlp")
+        else:
+            x = x + h_mlp
 
         return x
-    
-    def sph_skip_connection(self, x: torch.Tensor, h: torch.Tensor, place: str = "attn"):
+
+    def _sph_skip_connection(self, x: torch.Tensor, h: torch.Tensor, place: str):
         if place == "attn":
             lr = self.attn_alpha * (self.attn_alpha_init_value / self.attn_alpha_init_scaling)
-            lr = torch.abs(lr)
-        elif place == "mlp":
+        else:
             lr = self.mlp_alpha * (self.mlp_alpha_init_value / self.mlp_alpha_init_scaling)
-            lr = torch.abs(lr)
-        
-        A_norm = F.normalize(x, p=2.0, dim=-1) # normally, normalization is not needed
+        lr = torch.abs(lr)
+
+        A_norm = F.normalize(x, p=2.0, dim=-1)
         B_norm = F.normalize(h, p=2.0, dim=-1)
-        # res = (1.0 - lr) * A_norm + lr * B_norm  <---  linearized SLERP
-        res = A_norm + lr * (B_norm - A_norm)
-        x = F.normalize(res, p=2.0, dim=-1)
 
-        return x
-
-
-class HyperbolicBlock(nn.Module):
-    def __init__(self, config: MultiGeomGPTConfig):
-        super().__init__()
-
-        self.n_heads = config.n_heads
-        self.head_dim = config.head_dim
-        self.n_embd = config.n_embd
-
-        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.attn_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.rotary = Rotary(self.head_dim)
-        
-        self.mlp_uv_proj = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
-        self.silu = nn.SiLU()
-        self.mlp_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-    
-
-    def forward(self, x: torch.Tensor):
-        B, T, C = x.size()
-        h = F.rms_norm(x, (x.size(-1),)) 
-
-        qkv = self.qkv(h).split(C, dim=2)
-        q, k, v = [x.view(B, T, self.n_heads, self.head_dim) for x in qkv]
-
-        cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        attn = custom_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            mode="hyp",
-        ).transpose(1, 2).contiguous().view(B, T, C)
-        h_attn = self.attn_proj(attn)
-        
-        x = x + h_attn
-        h = F.rms_norm(x, (x.size(-1),)) 
-
-        # SwiGLU mlp
-        uv = self.mlp_uv_proj(h)
-        u, v = torch.chunk(uv, 2, dim=-1)
-        h_mlp = u * self.silu(v)
-        h_mlp = self.mlp_proj(h_mlp)
-
-        x = x + h_mlp
-
-        return x
-
-
-class EuclideanBlock(nn.Module):
-    def __init__(self, config: MultiGeomGPTConfig):
-        super().__init__()
-
-        self.n_heads = config.n_heads
-        self.head_dim = config.head_dim
-        self.n_embd = config.n_embd
-
-        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
-        self.attn_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.rotary = Rotary(self.head_dim)
-        
-        self.mlp_uv_proj = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=False)
-        self.silu = nn.SiLU()
-        self.mlp_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-    
-
-    def forward(self, x: torch.Tensor):
-        B, T, C = x.size()
-        h = F.rms_norm(x, (x.size(-1),)) 
-
-        qkv = self.qkv(h).split(C, dim=2)
-        q, k, v = [x.view(B, T, self.n_heads, self.head_dim) for x in qkv]
-
-        cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        attn = custom_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            mode="euc",
-            scale=1 / (self.n_embd ** 0.5),
-        ).transpose(1, 2).contiguous().view(B, T, C)
-        h_attn = self.attn_proj(attn)
-        
-        x = x + h_attn
-        h = F.rms_norm(x, (x.size(-1),)) 
-
-        # SwiGLU mlp
-        uv = self.mlp_uv_proj(h)
-        u, v = torch.chunk(uv, 2, dim=-1)
-        h_mlp = u * self.silu(v)
-        h_mlp = self.mlp_proj(h_mlp)
-
-        x = x + h_mlp
-
-        return x
-
-
-if __name__ == "__main__":
-    config = MultiGeomGPTConfig(multi_geom_block=False)
-    sph_block = EuclideanBlock(config=config)
-    x = torch.randn(16, 512, config.n_embd)
-    result = sph_block(x)
+        return F.normalize(A_norm + lr * (B_norm - A_norm), p=2.0, dim=-1)
 
 
 class LorentzMLR(nn.Module):
@@ -425,52 +384,35 @@ class LorentzMLR(nn.Module):
         nn.init.uniform_(self.a, -stdv, stdv)
 
 
-
 class MultiGeometryGPT(nn.Module):
     def __init__(self, config: MultiGeomGPTConfig):
         super().__init__()
         self.config = config
+        wte = nn.Embedding(config.vocab_size, config.n_embd)
+
         if config.multi_geom_block:
-            self.transformer = nn.ModuleDict(dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=nn.ModuleList([MultiGeometryBlock(config) for _ in range(config.n_layers)]),
-                # ln_f=RMSNorm(config.n_embd)
-            ))
+            layers = nn.ModuleList([MultiGeometryBlock(config) for _ in range(config.n_layers)])
         else:
-            block_types = {
-                "euc": EuclideanBlock,
-                "hyp": HyperbolicBlock,
-                "sph": SphericalBlock
-            }
-            geom_dict = {
-                "euc": config.n_euc_layers,
-                "hyp": config.n_hyp_layers,
-                "sph": config.n_sph_layers,
-            }
-            layers_dict = nn.ModuleDict()
+            geom_dict = {"euc": config.n_euc_layers, "hyp": config.n_hyp_layers, "sph": config.n_sph_layers}
+            layers_list = []
             for geom_type in config.layers_order:
                 n_layers = geom_dict[geom_type]
-                geom_blocks = nn.ModuleList([block_types[geom_type](config) for _ in range(n_layers)])
-                layers_dict[geom_type] = geom_blocks
-            self.transformer = nn.ModuleDict(dict(
-                wte=nn.Embedding(config.vocab_size, config.n_embd),
-                h=layers_dict,
-                # ln_f=RMSNorm(config.n_embd)
-            ))
+                layers_list.extend([JointGeometryBlock(config, geom_type) for _ in range(n_layers)])
+            layers = nn.ModuleList(layers_list)
 
+        self.transformer = nn.ModuleDict(dict(
+            wte=wte,
+            layers=layers
+        ))
+        
         if config.lm_head_mode == 'euc':
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
             self._init_weights(self.lm_head)
         elif config.lm_head_mode == 'hyp':
             self.lm_head = LorentzMLR(config)
         elif config.lm_head_mode == 'sph':
-            self.lm_head = nn.Sequential(
-                nn.Linear(config.n_embd, config.vocab_size),
-                # nn.LogSoftmax(dim=-1)
-            )
-            self._init_weights(self.lm_head[0])
-        
-        # print(self.model_size())
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+            self._init_weights(self.lm_head)
 
     @staticmethod
     def _init_weights(module):
@@ -484,7 +426,7 @@ class MultiGeometryGPT(nn.Module):
         x = self.transformer.wte(idx)
         x = F.rms_norm(x, (x.size(-1),))
 
-        for block in self.transformer.h:
+        for block in self.transformer.layers:
             x = block(x)
 
         # x = self.transformer.ln_f(x)
@@ -498,6 +440,15 @@ class MultiGeometryGPT(nn.Module):
             loss = None
 
         return logits, loss
+    
+    def normalize_sph_matrices(self):
+        for layer in self.transformer.layers:
+            if layer.geom_type == "sph":
+                layer.attn.qkv.weight.data.copy_(F.normalize(layer.attn.qkv.weight.data, p=2.0, dim=-1))
+                layer.attn.out_proj.weight.data.copy_(F.normalize(layer.attn.out_proj.weight.data, p=2.0, dim=-1))
+
+                layer.mlp.uv_proj.weight.data.copy_(F.normalize(layer.mlp.uv_proj.weight.data, p=2.0, dim=-1))
+                layer.mlp.out_proj.weight.data.copy_(F.normalize(layer.mlp.out_proj.weight.data, p=2.0, dim=-1))
 
     def generate(self, context: torch.Tensor, max_length: int, temperature: float = 1.0, top_k: int = None):
         self.eval()
@@ -521,3 +472,10 @@ class MultiGeometryGPT(nn.Module):
             return f"{total_params / 1e6:.2f}M"
         else:
             return f"{total_params / 1e3:.2f}K"
+
+
+if __name__ == "__main__":
+    config = MultiGeomGPTConfig(multi_geom_block=False)
+    model = MultiGeometryGPT(config=config)
+    x = torch.randint(low=0, high=config.vocab_size - 1, size=(16, config.context_length))
+    result = model(x)
