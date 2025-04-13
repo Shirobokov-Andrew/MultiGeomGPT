@@ -250,7 +250,7 @@ if master_process:
 lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("k" not in name))]
 
 # params = list(raw_model.transformer.h.parameters())
-params = [p for name, p in raw_model.transformer.h.named_parameters() if (p.requires_grad and ("hyp_curvature" not in name))]
+params = [p for name, p in raw_model.transformer.layers.named_parameters() if (p.requires_grad and ("hyp_curvature" not in name))]
 matrix_params = [p for p in params if p.ndim == 2]
 wte_params = [raw_model.transformer.wte.weight]
 
