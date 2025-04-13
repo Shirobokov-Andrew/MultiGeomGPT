@@ -42,34 +42,30 @@ def custom_attention(
         dropout: nn.Dropout = None,
         curvature: float = None, 
         mode: str = 'euc', 
-        is_causal: bool = True, 
         scale: float = None, 
         ) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
-
-    if is_causal:
+    if mode == "euc":
+        return F.scaled_dot_product_attention(query, key, value, is_causal=True, scale=scale)
+    elif mode == "sph":
+        q_norm = F.normalize(query, p=2, dim=-1)
+        k_norm = F.normalize(key, p=2, dim=-1)
+        return F.scaled_dot_product_attention(q_norm, k_norm, value, is_causal=True, scale=scale)
+    elif mode == "hyp":
+        L, S = query.size(-2), key.size(-2)
+        attn_bias = torch.zeros(L, S, dtype=query.dtype, device=query.device)
         mask = torch.triu(torch.ones(L, S, dtype=torch.bool, device=query.device), diagonal=1)
         attn_bias.masked_fill_(mask, float('-inf'))
 
-    if mode == 'euc':
-        attn_weight = (query @ key.transpose(-2, -1)) * scale
-    elif mode == 'hyp':
         lq = project(query, k=curvature).unsqueeze(-2)
         lk = project(key, k=curvature).unsqueeze(-3)
         dis = distance(lq, lk, k=curvature)
         attn_weight = 1 / (1e-6 + dis)
-    elif mode == 'sph':
-        q_norm = F.normalize(query, p=2, dim=-1)
-        k_norm = F.normalize(key, p=2, dim=-1)
-        attn_weight = (q_norm @ k_norm.transpose(-2, -1)) * scale
 
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    if dropout is not None:
-        attn_weight = dropout(attn_weight)
-    # attn_weight = F.dropout(attn_weight, p=dropout_p, training=training)
-    return attn_weight @ value
+        attn_weight += attn_bias
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        if dropout is not None:
+            attn_weight = dropout(attn_weight)
+        return attn_weight @ value
 
 
 class RMSNorm(nn.Module):
@@ -201,7 +197,7 @@ class JointGeometryMLP(nn.Module):
     def _init_spherical_params(self):
         self.init_value = 1.0
         self.init_scaling = 1.0
-        self.suv = nn.Parameter(self.init_scaling * torch.ones(2 * 4 * self.n_embd, dtype=torch.float32))
+        self.suv = nn.Parameter(self.init_scaling * torch.ones(2 * 4 * self.n_embd,))
     
     def forward(self, x: torch.Tensor):
         uv = self.uv_proj(x)
@@ -294,11 +290,11 @@ class JointGeometryBlock(nn.Module):
     def _init_spherical_params(self):
         self.attn_alpha_init_value = 0.05
         self.attn_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
-        self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
+        self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.n_embd))
 
         self.mlp_alpha_init_value = 0.05
         self.mlp_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
-        self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
+        self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.n_embd))
 
     def forward(self, x: torch.Tensor):
         if self.geom_type in ["euc", "hyp"]:

@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] ="6"
+os.environ["CUDA_VISIBLE_DEVICES"] ="3"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 import datetime
@@ -200,7 +200,9 @@ x, y = train_loader.next_batch()
 
 # Model setup and wrap to DDP
 model = MultiGeometryGPT(model_config).to(device)
-model = model.to(device)    
+# x = torch.randint(low=0, high=model_config.vocab_size - 1, size=(train_config.device_batch_size, model_config.context_length)).to(device)
+# result = model(x)
+# model = model.to(device)    
 # model = torch.compile(model)
 if ddp_is_enabled:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -252,11 +254,16 @@ lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.re
 # params = list(raw_model.transformer.h.parameters())
 params = [p for name, p in raw_model.transformer.layers.named_parameters() if (p.requires_grad and ("hyp_curvature" not in name))]
 matrix_params = [p for p in params if p.ndim == 2]
+vector_params = [p for p in params if p.ndim == 1]
 wte_params = [raw_model.transformer.wte.weight]
 
 optimizer_head = torch.optim.Adam(lm_head_params, lr=model_config.head_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
 optimizer_wte = torch.optim.Adam(wte_params, lr=model_config.wte_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
-optimizer_muon = Muon(matrix_params, lr=model_config.matrix_lr, momentum=0.95, ddp_is_enabled=ddp_is_enabled)
+optimizer_matrix = Muon(matrix_params, lr=model_config.matrix_lr, momentum=0.95, ddp_is_enabled=ddp_is_enabled)
+optimizers = [optimizer_head, optimizer_matrix, optimizer_wte]
+if len(vector_params) > 0:
+    optimizer_vector = torch.optim.Adam(vector_params, lr=model_config.vector_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
+    optimizers.append(optimizer_vector)
 
 
 if len(attn_k_params) > 0 and len(head_k_params) > 0:
@@ -265,7 +272,7 @@ if len(attn_k_params) > 0 and len(head_k_params) > 0:
         {"params": attn_k_params, "lr": model_config.attn_k_lr}  
     # ], fused=True)
     ], momentum=0.9, nesterov=True)
-    optimizers = [optimizer_head, optimizer_muon, optimizer_wte, optimizer_k]
+    optimizers.append(optimizer_k)
     if master_process:
         print(f"attn.hyp_curvature is learned with lr={model_config.attn_k_lr}")
         print(f"lm_head.k is learned with lr={model_config.head_k_lr}")
@@ -275,7 +282,7 @@ elif len(attn_k_params) > 0 and len(head_k_params) == 0:
         {"params": attn_k_params, "lr": model_config.attn_k_lr}
     # ], fused=True)
     ], momentum=0.9, nesterov=True)
-    optimizers = [optimizer_head, optimizer_muon, optimizer_wte, optimizer_k]
+    optimizers.append(optimizer_k)
     if master_process:
         print(f"attn.hyp_curvature is learned with {model_config.attn_k_lr} lr")
 
@@ -284,14 +291,13 @@ elif len(attn_k_params) == 0 and len(head_k_params) > 0:
         {"params": head_k_params, "lr": model_config.head_k_lr}
     # ], fused=True)
     ], momentum=0.9, nesterov=True)
-    optimizers = [optimizer_head, optimizer_muon, optimizer_wte, optimizer_k]
+    optimizers.append(optimizer_k)
     if master_process:
         print(f"lm_head.k is learned with {model_config.head_k_lr} lr")
 
 else:
-    optimizers = [optimizer_head, optimizer_muon, optimizer_wte]
     if master_process:
-        print(f"attn.hyp_curvature and lm_head.l are not learned")
+        print(f"attn.hyp_curvature and lm_head.k are not learned")
 
 # Configure schedulers
 init_lr = 1.0
@@ -381,6 +387,7 @@ train_loss_accum = 0.0
 train_loss_count = 0
 # begin training
 train_loader.reset()
+raw_model.normalize_sph_matrices()
 
 for step in tqdm(range(train_config.num_iterations + 1)):
     last_step = (step == train_config.num_iterations)
@@ -504,12 +511,16 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         grad_norm_wte = compute_grad_norm(wte_params)
         grad_norm_head_k = compute_grad_norm(head_k_params)
         grad_norm_attn_k = compute_grad_norm(attn_k_params)
+        if len(vector_params) > 0:
+            grad_norm_vector = compute_grad_norm(vector_params)
 
         writer.add_scalar("grad_norm/lm_head", grad_norm_lm_head, step)
         writer.add_scalar("grad_norm/matrix", grad_norm_matrix, step)
         writer.add_scalar("grad_norm/wte", grad_norm_wte, step)
         writer.add_scalar("grad_norm/head_k", grad_norm_head_k, step)
         writer.add_scalar("grad_norm/attn_k", grad_norm_attn_k, step)
+        if len(vector_params) > 0:
+            writer.add_scalar("grad_norm/vector", grad_norm_vector, step)
 
         print("=" * 30 + "attn k PARAMS" + "=" * 30)
         for param in attn_k_params:
@@ -526,15 +537,18 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         print(f"Step: {step}, grad_norm/wte", grad_norm_wte)
         print(f"Step: {step}, grad_norm/head_k", grad_norm_head_k)
         print(f"Step: {step}, grad_norm/attn_k", grad_norm_attn_k)
+        if len(vector_params) > 0:
+            print(f"Step: {step}, grad_norm/vector", grad_norm_vector)
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
-        # sched.step()
+        sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # train_loss_accum += train_loss.item()
     train_loss_count += train_accumulation_steps
+    raw_model.normalize_sph_matrices()
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
