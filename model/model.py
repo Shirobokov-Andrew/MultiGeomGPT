@@ -1,12 +1,10 @@
 # model.py
-import sys
-sys.path.append("/home/jovyan/shirobokov/multi_geom_nanogpt/")
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# from model.lmath import project, distance
+from model.lmath import project, distance
 from config.model_config import MultiGeomGPTConfig
 
 
