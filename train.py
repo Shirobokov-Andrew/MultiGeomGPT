@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] ="3"
+# os.environ["CUDA_VISIBLE_DEVICES"] ="1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 import datetime
@@ -300,12 +300,10 @@ else:
         print(f"attn.hyp_curvature and lm_head.k are not learned")
 
 # Configure schedulers
-init_lr = 1.0
-end_lr  = 0.1
 def get_lr(it):
     t = max(0, min(1, 1 - it / train_config.num_iterations))
     w = min(t / train_config.cooldown_frac, 1.0)
-    return w * init_lr + (1 - w) * end_lr
+    return w * train_config.init_lr + (1 - w) * train_config.end_lr
     
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
@@ -581,150 +579,3 @@ if master_process:
     writer.close()
 if ddp_is_enabled:
     dist.destroy_process_group()
-
-
-
-# # Загрузка данных
-# class CharDataset(Dataset):
-#     def __init__(self, dataset_path: str, context_length: int, split: str = "train"):
-#         self.data = np.memmap(os.path.join(dataset_path, f'{split}.bin'), 
-#                             dtype=np.uint16, mode='r')
-#         self.context_length = context_length
-#         with open(os.path.join(dataset_path, 'meta.pkl'), 'rb') as f:
-#             meta = pickle.load(f)
-#             self.stoi, self.itos = meta['stoi'], meta['itos']
-#             self.vocab_size = meta['vocab_size']
-            
-#     def __len__(self):
-#         return len(self.data) - self.context_length
-    
-#     def __getitem__(self, idx):
-#         x = torch.from_numpy(self.data[idx:idx + self.context_length].astype(np.int64))
-#         y = torch.from_numpy(self.data[idx + 1:idx + 1 + self.context_length].astype(np.int64))
-#         return x, y
-
-# train_dataset = CharDataset(train_config.dataset_path, train_config.context_length, 'train')
-# val_dataset = CharDataset(train_config.dataset_path, train_config.context_length, 'val')
-
-# train_loader = DataLoader(train_dataset, batch_size=train_config.batch_size, shuffle=True)
-# val_loader = DataLoader(val_dataset, batch_size=train_config.batch_size)
-
-# # Инициализация модели
-# model = MultiGeometryGPT(model_config).to(train_config.device)
-# print(model.model_size())
-# # model = torch.compile(model)
-
-# # Оптимизаторы
-# param_groups = [
-#     {'params': [p for n, p in model.named_parameters() if 'hyp_curvature' not in n], 'lr': train_config.lr},
-#     {'params': [p for n, p in model.named_parameters() if 'hyp_curvature' in n], 'lr': model_config.k_lr}
-# ]
-# optimizers = [torch.optim.Adam(g['params'], lr=g['lr']) for g in param_groups if g['params']]
-
-# # Scheduler
-# def get_lr(it):
-#     t = max(0, min(1, 1 - it / train_config.num_iterations))
-#     w = min(t / train_config.cooldown_frac, 1.0)
-#     return w * train_config.lr + (1 - w) * train_config.end_lr
-
-# schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-
-# # TensorBoard
-# writer = SummaryWriter(log_dir=os.path.join('runs', time.strftime("%Y%m%d-%H%M%S")))
-
-# # Метрики
-# def estimate_loss(model, loader):
-#     print("validation started")
-#     model.eval()
-#     losses = []
-#     with torch.no_grad():
-#         for x, y in tqdm(loader):
-#             x, y = x.to(train_config.device), y.to(train_config.device)
-#             _, loss = model(x, y)
-#             losses.append(loss.item())
-#     model.train()
-#     mean_val_loss = np.mean(losses)
-#     print(f"validation ended with avg loss={mean_val_loss}")
-#     return mean_val_loss
-
-# # Генерация текста
-# def generate_text(model: MultiGeometryGPT, prompt: str, max_length: int = 100):
-#     context = torch.tensor([train_dataset.stoi[c] for c in prompt], 
-#                          dtype=torch.long, device=train_config.device)[None,...]
-#     generated = model.generate(context, max_length=max_length)
-#     model.train()
-#     return ''.join([train_dataset.itos[i] for i in generated[0].tolist()])
-
-# # Тренировочный цикл
-# scaler = torch.amp.GradScaler("cuda")
-# best_val_loss = float('inf')
-# train_losses = []
-# grad_norms = {'main': [], 'curvature': []}
-
-# for step in tqdm(range(train_config.num_iterations)):
-#     # Обучение
-#     x, y = next(iter(train_loader))
-#     x, y = x.to(train_config.device), y.to(train_config.device)
-    
-#     with torch.amp.autocast(device_type=train_config.device, dtype=torch.bfloat16):
-#         logits, loss = model(x, y)
-    
-#     # Backprop
-#     scaler.scale(loss).backward()
-    
-#     # Логирование градиентов
-#     if step % train_config.train_loss_every == 0:
-#         total_norm = 0.0
-#         curvature_norm = 0.0
-#         for n,p in model.named_parameters():
-#             if p.grad is not None:
-#                 grad_norm = p.grad.norm().item()**2
-#                 if 'hyp_curvature' in n:
-#                     curvature_norm += grad_norm
-#                 else:
-#                     total_norm += grad_norm
-#         grad_norms['main'].append(total_norm**0.5)
-#         grad_norms['curvature'].append(curvature_norm**0.5)
-    
-#     # Оптимизация
-#     for optim in optimizers:
-#         scaler.step(optim)
-#     scaler.update()
-#     for optim in optimizers:
-#         optim.zero_grad()
-    
-#     # Обновление learning rate
-#     for sched in schedulers:
-#         sched.step()
-    
-#     # Логирование
-#     train_losses.append(loss.item())
-#     if step % train_config.train_loss_every == 0:
-#         avg_loss = np.mean(train_losses[-train_config.train_loss_every:])
-#         print(f"Step={step}, avg train loss={avg_loss}")
-#         writer.add_scalar('Loss/train', avg_loss, step)
-#         writer.add_scalar('Grad/main', grad_norms['main'][-1], step)
-#         writer.add_scalar('Grad/curvature', grad_norms['curvature'][-1], step)
-        
-#     # Валидация
-#     if step % train_config.val_loss_every == 0 and step != 0:
-#         val_loss = estimate_loss(model, val_loader)
-#         writer.add_scalar('Loss/val', val_loss, step)
-#         if val_loss < best_val_loss:
-#             torch.save(model.state_dict(), 'best_model.pth')
-#             best_val_loss = val_loss
-            
-#     # Генерация текста
-#     if step % train_config.generate_every == 0:
-#         text = generate_text(model, "May god", max_length=250)
-#         print(f"Generated text: {text}")
-#         writer.add_text('Generated', text, step)
-        
-#         # Логирование кривизны
-#         if model_config.k_lr:
-#             for i, layer in enumerate(model.transformer.h):
-#                 if hasattr(layer.attn, 'hyp_curvature'):
-#                     curv = layer.attn.hyp_curvature.detach().cpu().numpy()
-#                     writer.add_scalar(f'Curvature/layer_{i}', curv, step)
-
-# writer.close()
