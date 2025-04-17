@@ -98,11 +98,11 @@ class MultiGeometryAttention(nn.Module):
 
         if self.n2 > 0:
             if config.attn_k_lr:
-                # self.hyp_curvature = nn.Parameter(
-                #     torch.full((1, self.n2, 1, 1), config.curvature))
-                x = torch.randn(1, self.n2, 1, 1, device=self.qkv.weight.device)
-                init_k = torch.exp(x) * config.curvature
-                self.hyp_curvature = nn.Parameter(init_k)
+                self.hyp_curvature = nn.Parameter(
+                    torch.full((1, self.n2, 1, 1), config.curvature))
+                # x = torch.randn(1, self.n2, 1, 1, device=self.qkv.weight.device)
+                # init_k = torch.exp(x) * config.curvature
+                # self.hyp_curvature = nn.Parameter(init_k)
             else:
                 self.register_buffer('hyp_curvature',
                                      torch.full((1, self.n2, 1, 1), config.curvature))
@@ -239,7 +239,9 @@ class JointGeometryAttention(nn.Module):
             init_k = torch.exp(x) * self.config.curvature
             self.hyp_curvature = nn.Parameter(init_k)
         else:
-            self.register_buffer('hyp_curvature', torch.full((1, self.n_heads, 1, 1), self.config.curvature))
+            x = torch.randn(1, self.n_heads, 1, 1, device=self.qkv.weight.device)
+            fixed_k = torch.exp(x) * self.config.curvature
+            self.register_buffer('hyp_curvature', fixed_k)
     
     def _init_spherical_params(self):
         self.sqk_init_value = 1.0

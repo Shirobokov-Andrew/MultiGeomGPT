@@ -5,27 +5,29 @@ from .model_config import context_length
 @dataclass
 class TrainConfig:
     # Dataset configuration
-    train_bin_path: str = "./data/fineweb10B/fineweb_train_*.bin"
-    val_bin_path: str = "./data/fineweb10B/fineweb_val_*.bin"
+    # train_bin_path: str = "./data/fineweb10B/fineweb_train_*.bin"
+    # val_bin_path: str = "./data/fineweb10B/fineweb_val_*.bin"
+    train_bin_path: str = "./data/wikitext103/train.bin"
+    val_bin_path: str = "./data/wikitext103/val.bin"
     context_length: int = context_length  # train context length
 
     # Training setup
     device: str = "cuda:0" # used only w/o DDP
-    device_batch_size: int = 2
-    # global_batch_size: int = 8 * 32 # global batch size must be divisible to (device_batch_size * ddp_world_size) in order to perfrom grad accumulation steps
-    global_batch_size: int = 252 # for 6 devices
+    device_batch_size: int = 32
+    global_batch_size: int = 8 * 16 # global batch size must be divisible to (device_batch_size * ddp_world_size) in order to perfrom grad accumulation steps
+    # global_batch_size: int = 252 # for 6 devices
     num_iterations: int = 10000
     seed: int = 42
-    # num_val_tokens: int = 10_485_760 # num_val_tokens must be divisible by (device_batch_size * context_length * ddp_world_size) tokens processed by all devices simultaniously
-    num_val_tokens: int = 10_481_664 # for 6 devices
+    num_val_tokens: int = 245760 # num_val_tokens must be divisible by (device_batch_size * context_length * ddp_world_size) tokens processed by all devices simultaniously
+    # num_val_tokens: int = 10_481_664 # for 6 devices
     # Optimization parameters
     init_lr: float = 1.0         # Base learning rate
     end_lr: float = 0.1     # Final learning rate after cooldown
     cooldown_frac: float = 0.5  # Fraction of training for LR cooldown
 
     # Logging and monitoring
-    train_loss_every: int = 10   # Log training loss every N steps
-    val_loss_every: int = 500    # Calculate validation loss every N steps
+    train_loss_every: int = 1   # Log training loss every N steps
+    val_loss_every: int = 50    # Calculate validation loss every N steps
     generate_every: int = 500    # Generate samples every N steps
     gradient_log_every: int = 500 # Log gradient statistics every N steps
     save_every: int = 500 # Save checkpoint

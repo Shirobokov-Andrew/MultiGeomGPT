@@ -2,11 +2,12 @@ import numpy as np
 import glob
 import torch
 
+
 def _peek_data_shard(filename):
     # only reads the header, returns header data
     with open(filename, "rb") as f:
         # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256*4), dtype=np.int32)
+        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
     if header[0] != 20240520:
         print("ERROR: magic number mismatch in the data .bin file!")
         print("---> HINT: Are you passing in a correct file with --input_bin?")
@@ -16,6 +17,7 @@ def _peek_data_shard(filename):
     assert header[1] == 1, "unsupported version"
     ntok = header[2] # number of tokens (claimed)
     return ntok # for now just return the number of tokens
+
 
 def _load_data_shard(filename):
     with open(filename, "rb") as f:
@@ -29,6 +31,7 @@ def _load_data_shard(filename):
         tokens = np.frombuffer(f.read(), dtype=np_dtype)
     assert len(tokens) == ntok, "number of tokens read does not match header?"
     return tokens
+
 
 class DistributedDataLoader:
     def __init__(self, filename_pattern, B, T, process_rank, num_processes):

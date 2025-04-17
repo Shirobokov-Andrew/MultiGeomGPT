@@ -2,12 +2,11 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import os
-# os.environ["CUDA_VISIBLE_DEVICES"] ="1"
+os.environ["CUDA_VISIBLE_DEVICES"] ="6"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 import datetime
 import json
-import pickle
 import random
 from tqdm import tqdm
 from typing import Union
@@ -16,7 +15,6 @@ import numpy as np
 
 import torch
 torch.set_float32_matmul_precision('high')
-from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -41,7 +39,9 @@ def create_run_id(train_config: TrainConfig, model_config: MultiGeomGPTConfig, d
     dataset_aliases = {
         'TinyStories': 'ts',
         'TinyStoriesChar': 'tsc',
-        'FineWeb': 'fw'
+        'FineWeb': 'fw',
+        'Wikitext2': 'wt2',
+        'Wikitext103': 'wt103',
     }
     mode_aliases = {
         'euc': 'e',
@@ -82,6 +82,22 @@ def setup_tokenizer(train_config: TrainConfig, model_config: MultiGeomGPTConfig)
             eos_token="<|endoftext|>",
             unk_token="[UNK]",
             pad_token="[PAD]",
+        )
+    elif "wikitext2" in train_config.train_bin_path:
+        dataset_name = "Wikitext2"
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=os.path.join(train_config.train_bin_path[:-9], "wikitext2_tokenizer.json"),
+            eos_token="<|endoftext|>",
+            unk_token="<UNK>",
+            pad_token="<PAD>",
+        )
+    elif "wikitext103" in train_config.train_bin_path:
+        dataset_name = "Wikitext103"
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_file=os.path.join(train_config.train_bin_path[:-9], "wikitext103_tokenizer.json"),
+            eos_token="<|endoftext|>",
+            unk_token="<UNK>",
+            pad_token="<PAD>",
         )
     else:
         dataset_name = "FineWeb"
@@ -259,7 +275,8 @@ wte_params = [raw_model.transformer.wte.weight]
 
 optimizer_head = torch.optim.Adam(lm_head_params, lr=model_config.head_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
 optimizer_wte = torch.optim.Adam(wte_params, lr=model_config.wte_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
-optimizer_matrix = Muon(matrix_params, lr=model_config.matrix_lr, momentum=0.95, ddp_is_enabled=ddp_is_enabled)
+# optimizer_matrix = Muon(matrix_params, lr=model_config.matrix_lr, momentum=0.95, ddp_is_enabled=ddp_is_enabled)
+optimizer_matrix = torch.optim.Adam(matrix_params, lr=model_config.matrix_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
 optimizers = [optimizer_head, optimizer_matrix, optimizer_wte]
 if len(vector_params) > 0:
     optimizer_vector = torch.optim.Adam(vector_params, lr=model_config.vector_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
@@ -385,7 +402,8 @@ train_loss_accum = 0.0
 train_loss_count = 0
 # begin training
 train_loader.reset()
-raw_model.normalize_sph_matrices()
+if not model_config.multi_geom_block:
+    raw_model.normalize_sph_matrices()
 
 for step in tqdm(range(train_config.num_iterations + 1)):
     last_step = (step == train_config.num_iterations)
@@ -429,7 +447,7 @@ for step in tqdm(range(train_config.num_iterations + 1)):
 
     if train_config.generate_every and master_process and ((step) % train_config.generate_every == 0):
         # Use a fixed prompt or context for generation
-        prompt = "But the silence was"  # Customize as per your dataset
+        prompt = "London is a "  # Customize as per your dataset
         context = encode_text(tokenizer, prompt, device)
         
         # Generate text
@@ -502,6 +520,12 @@ for step in tqdm(range(train_config.num_iterations + 1)):
             continue
         p.grad /= train_accumulation_steps
 
+    if model_config.grad_k_clip != 0.0:
+        if head_k_params:
+            torch.nn.utils.clip_grad_norm_(head_k_params, model_config.grad_k_clip)
+        if attn_k_params:
+            torch.nn.utils.clip_grad_norm_(attn_k_params, model_config.grad_k_clip)
+    
     if master_process and step % train_config.train_loss_every == 0:
 
         grad_norm_lm_head = compute_grad_norm(lm_head_params)
@@ -546,7 +570,8 @@ for step in tqdm(range(train_config.num_iterations + 1)):
     model.zero_grad(set_to_none=True)
     # train_loss_accum += train_loss.item()
     train_loss_count += train_accumulation_steps
-    raw_model.normalize_sph_matrices()
+    if not model_config.multi_geom_block:
+        raw_model.normalize_sph_matrices()
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
