@@ -88,6 +88,7 @@ class FullyHyperbolicBlock(nn.Module):
         self.attn_curvatures = nn.Parameter(torch.ones(1, config.n_heads, 1, 1) * config.curvature)
         self.qkv = nn.Linear(config.n_embd + 1, 3 * config.n_embd, bias=False)
         self.attn_proj = nn.Linear((self.config.head_dim + 1) * self.config.n_heads, config.n_embd)
+        self.rotary = Rotary(config.head_dim)
     
     def forward(self, x: torch.Tensor):
         lx = project(x, k=self.block_curvature) # (B, T, n_embd+1)
@@ -100,14 +101,17 @@ class FullyHyperbolicBlock(nn.Module):
         B, T, C = lx.shape[0], lx.shape[1], lx.shape[2]
         # calculate q, k, v from hyperbolic vector and map them to another hyperboloid
         qkv = self.qkv(lx).split(C - 1, dim=2) # here C==n_embd+1, since lx is hyperbolic
-        q, k, v = [x.view(B, T, self.config.n_heads, self.config.head_dim).transpose(1, 2) for x in qkv] # (B, num_heads, T, head_dim)
-        lq = project(q, k=self.attn_curvatures).unsqueeze(-2) # (B, num_heads, T, 1, head_dim+1) # unsqueeze to calculate pairwise distance
-        lk = project(k, k=self.attn_curvatures).unsqueeze(-3) # (B, num_heads, 1, T, head_dim+1)
-        lv = project(v, k=self.attn_curvatures) # (B, num_heads, T, head_dim+1)
+        q, k, v = [x.view(B, T, self.config.n_heads, self.config.head_dim) for x in qkv] # (B, T, num_heads, head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
 
-        L, S = q.size(-2), k.size(-2)
-        attn_bias = torch.zeros(L, S, dtype=lq.dtype, device=lq.device)
-        mask = torch.triu(torch.ones(L, S, dtype=torch.bool, device=lq.device), diagonal=1)
+        lq = project(q.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-2) # (B, num_heads, T, 1, head_dim+1) # unsqueeze to calculate pairwise distance
+        lk = project(k.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-3) # (B, num_heads, 1, T, head_dim+1)
+        lv = project(v.transpose(1, 2), k=self.attn_curvatures) # (B, num_heads, T, head_dim+1)
+
+        attn_bias = torch.zeros(T, T, dtype=lq.dtype, device=lq.device)
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=lq.device), diagonal=1)
         attn_bias.masked_fill_(mask, float('-inf'))
 
         # attn matrix is an determined by the inverse geodesic distance on hyperboloid
