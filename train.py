@@ -15,17 +15,26 @@ import numpy as np
 
 import torch
 torch.set_float32_matmul_precision('high')
+torch.utils.backcompat.broadcast_warning.enabled=True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast # type: ignore #
 
-from model.model import MultiGeometryGPT
+from model.model import MultiGeometryGPT, FullyHyperbolicBlock
 from config.train_config import TrainConfig
 from config.model_config import MultiGeomGPTConfig
 from utils.loader import DistributedDataLoader
 from utils.muon import Muon
+from prodigyopt import Prodigy
+
+
+config = MultiGeomGPTConfig(multi_geom_block=False)
+model = FullyHyperbolicBlock(config=config)
+x = torch.randn(16, 512, 128)
+# x = torch.randint(low=0, high=config.vocab_size - 1, size=(16, config.context_length))
+result = model(x)
 
 
 def pretty_json(hp):
@@ -242,7 +251,6 @@ for name, param in raw_model.named_parameters():
             head_k_params.append(param)
         else:
             param.requires_grad = False
-        head_k_params.append(param)
     elif "attn.hyp_curvature" in name:
         if model_config.attn_k_lr > 0:
             param.requires_grad = True
@@ -277,44 +285,56 @@ optimizer_head = torch.optim.Adam(lm_head_params, lr=model_config.head_lr, betas
 optimizer_wte = torch.optim.Adam(wte_params, lr=model_config.wte_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
 # optimizer_matrix = Muon(matrix_params, lr=model_config.matrix_lr, momentum=0.95, ddp_is_enabled=ddp_is_enabled)
 optimizer_matrix = torch.optim.Adam(matrix_params, lr=model_config.matrix_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
+
+opt = Prodigy(lm_head_params + wte_params + matrix_params, lr=1., use_bias_correction=True, weight_decay=0.0)
 optimizers = [optimizer_head, optimizer_matrix, optimizer_wte]
+total_params_list = lm_head_params + wte_params + matrix_params
 if len(vector_params) > 0:
     optimizer_vector = torch.optim.Adam(vector_params, lr=model_config.vector_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
     optimizers.append(optimizer_vector)
 
+    total_params_list += vector_params
+
+# optimizers = [Prodigy(total_params_list, lr=1., use_bias_correction=True, weight_decay=0.0)]
 
 if len(attn_k_params) > 0 and len(head_k_params) > 0:
-    optimizer_k = torch.optim.SGD([
-        {"params": head_k_params, "lr": model_config.head_k_lr},  
-        {"params": attn_k_params, "lr": model_config.attn_k_lr}  
-    # ], fused=True)
-    ], momentum=0.9, nesterov=True)
-    optimizers.append(optimizer_k)
+    # optimizer_k = torch.optim.SGD([
+    #     {"params": head_k_params, "lr": model_config.head_k_lr},  
+    #     {"params": attn_k_params, "lr": model_config.attn_k_lr}  
+    # # ], fused=True)
+    # ], momentum=0.9, nesterov=True)
+    total_params_list += attn_k_params
+    total_params_list += head_k_params
+    # optimizers.append(optimizer_k)
     if master_process:
         print(f"attn.hyp_curvature is learned with lr={model_config.attn_k_lr}")
         print(f"lm_head.k is learned with lr={model_config.head_k_lr}")
 
 elif len(attn_k_params) > 0 and len(head_k_params) == 0:
-    optimizer_k = torch.optim.SGD([
-        {"params": attn_k_params, "lr": model_config.attn_k_lr}
-    # ], fused=True)
-    ], momentum=0.9, nesterov=True)
-    optimizers.append(optimizer_k)
+    # optimizer_k = torch.optim.SGD([
+    #     {"params": attn_k_params, "lr": model_config.attn_k_lr}
+    # # ], fused=True)
+    # ], momentum=0.9, nesterov=True)
+    total_params_list += attn_k_params
+    # optimizers.append(optimizer_k)
     if master_process:
         print(f"attn.hyp_curvature is learned with {model_config.attn_k_lr} lr")
 
 elif len(attn_k_params) == 0 and len(head_k_params) > 0:
-    optimizer_k = torch.optim.SGD([
-        {"params": head_k_params, "lr": model_config.head_k_lr}
-    # ], fused=True)
-    ], momentum=0.9, nesterov=True)
-    optimizers.append(optimizer_k)
+    # optimizer_k = torch.optim.SGD([
+    #     {"params": head_k_params, "lr": model_config.head_k_lr}
+    # # ], fused=True)
+    # ], momentum=0.9, nesterov=True)
+    total_params_list += head_k_params
+    # optimizers.append(optimizer_k)
     if master_process:
         print(f"lm_head.k is learned with {model_config.head_k_lr} lr")
 
 else:
     if master_process:
         print(f"attn.hyp_curvature and lm_head.k are not learned")
+
+optimizers = [Prodigy(total_params_list, lr=1., use_bias_correction=True, weight_decay=0.0)]
 
 # Configure schedulers
 def get_lr(it):
@@ -376,6 +396,7 @@ if master_process:
 
     writer.add_text("train_config", pretty_json(vars(train_config)))
     writer.add_text("model_config", pretty_json(vars(model_config)))
+    writer.add_text("model_size", model_size)
     logfile = os.path.join(logdir, 'log.txt')
     # create the log file
     with open(logfile, "w") as f:
@@ -460,25 +481,6 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         # Optionally log to console for immediate feedback
         print(f"[Step {step}] Generated Text: {generated_text}")
 
-        # Add curvature logging here
-        if k_params:  # Only log if curvature is learnable
-            # Log head curvature
-            for i, param in enumerate(head_k_params):
-                curvature_value = param.item()  
-                if i == 0:
-                    print(f"Head curvature value: {curvature_value:.2f}")
-                    writer.add_scalar(f"Curvature/Head", curvature_value, step)
-            
-            # Log attention layer curvatures
-            for i, param in enumerate(attn_k_params):
-                curvature_values = param.squeeze().detach().cpu()  # Shape: (n_heads,)
-                values_str = ' '.join([f"{v:.2f}" for v in curvature_values])
-                print(f"Attn layer {i} curvatures: [{values_str}]")
-                
-                # Log each head's curvature to tensorboard
-                for head_idx, value in enumerate(curvature_values):
-                    writer.add_scalar(f"Curvature/Attn/{i}/Head_{head_idx}", value, step)
-
     if master_process and (last_step or (train_config.save_every > 0 and step % train_config.save_every == 0)):
         # stop the clock
         torch.cuda.synchronize()
@@ -526,6 +528,9 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         if attn_k_params:
             torch.nn.utils.clip_grad_norm_(attn_k_params, model_config.grad_k_clip)
     
+    if model_config.total_grad_clip:
+        torch.nn.utils.clip_grad_norm_(total_params_list, model_config.total_grad_clip)
+    
     if master_process and step % train_config.train_loss_every == 0:
 
         grad_norm_lm_head = compute_grad_norm(lm_head_params)
@@ -546,12 +551,12 @@ for step in tqdm(range(train_config.num_iterations + 1)):
 
         print("=" * 30 + "attn k PARAMS" + "=" * 30)
         for param in attn_k_params:
-            print(param.detach().cpu().numpy().squeeze())
+            print(torch.exp(param.detach()).cpu().numpy().squeeze())
         # print("=" * 70)
 
         print("=" * 30 + "head k PARAMS" + "=" * 30)
         for param in head_k_params:
-            print(param.detach().cpu().numpy().squeeze())
+            print(torch.exp(param.detach()).cpu().numpy().squeeze())
         print("=" * 72)
 
         print(f"Step: {step}, grad_norm/lm_head", grad_norm_lm_head)
@@ -565,7 +570,7 @@ for step in tqdm(range(train_config.num_iterations + 1)):
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
-        sched.step()
+        # sched.step()
     # null the gradients
     model.zero_grad(set_to_none=True)
     # train_loss_accum += train_loss.item()
@@ -590,6 +595,30 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         writer.add_scalar('Loss/Train', avg_train_loss, tokens_seen)
         train_loss_accum = 0.0
         train_loss_count = 0
+
+        # Add curvature logging here
+        if k_params:  # Only log if curvature is learnable
+            # Log head curvature
+            for i, param in enumerate(head_k_params):
+                curvature_value = torch.exp(param.detach()).item()  
+                if i == 0:
+                    writer.add_scalar(f"Curvature/Head", curvature_value, tokens_seen)
+            
+            # Log attention layer curvatures
+            for i, param in enumerate(attn_k_params):
+                curvature_values = torch.exp(param.detach().squeeze()).cpu() # Shape: (n_heads,)
+                if bool(curvature_values.size()):
+                    values_str = ' '.join([f"{v:.2f}" for v in curvature_values])
+                else:
+                    values_str = f"{curvature_values.item()}"
+                # print(f"Attn layer {i} curvatures: [{values_str}]")
+                
+                # Log each head's curvature to tensorboard
+                if bool(curvature_values.size()):
+                    for head_idx, value in enumerate(curvature_values):
+                        writer.add_scalar(f"Curvature/Attn/{i}/Head_{head_idx}", value, tokens_seen)
+                else:
+                    writer.add_scalar(f"Curvature/Attn/{i}/Head_0", curvature_values.item(), tokens_seen)
 
 if master_process:
     total_training_time = time.time() - total_t0

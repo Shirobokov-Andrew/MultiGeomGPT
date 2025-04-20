@@ -5,6 +5,8 @@ import torch.jit
 def arcosh(x: torch.Tensor):
     dtype = x.dtype
     z = torch.sqrt(torch.clamp_min(x.double().pow(2) - 1.0, 1e-15))
+    if ((x + z) < 0).any().item():
+        print("!!!FOUND NEGATIVE IN DISTANCE!!!")
     return torch.log(x + z).to(dtype)
 
 
@@ -111,7 +113,7 @@ def distance(x, y, *, k, keepdim=False, dim=-1):
 @torch.jit.script
 def _dist(x, y, k: torch.Tensor, keepdim: bool = False, dim: int = -1):
     d = -_inner(x, y, dim=dim, keepdim=keepdim)
-    return torch.sqrt(k) * arcosh(d / k)
+    return torch.sqrt(torch.exp(k)) * arcosh(d / torch.exp(k))
 
 
 def dist0(x, *, k, keepdim=False, dim=-1):
@@ -183,7 +185,7 @@ def project(x, *, k, dim=-1):
 @torch.jit.script
 def _project(x, k: torch.Tensor, dim: int = -1):
     norm_x = torch.norm(x, p=2, dim=dim, keepdim=True) 
-    p0 = torch.sqrt(k + norm_x**2)  
+    p0 = torch.sqrt(torch.exp(k) + norm_x**2)  
     proj = torch.cat((p0, x), dim=dim)  
     return proj
 
@@ -286,7 +288,7 @@ def norm(u, *, keepdim=False, dim=-1):
 
 @torch.jit.script
 def _norm(u, keepdim: bool = False, dim: int = -1):
-    return torch.sqrt(torch.clamp_min(_inner(u, u, keepdim=keepdim), 1e-8))
+    return torch.sqrt(torch.clamp_min(-_inner(u, u, keepdim=keepdim), 1e-8))
 
 
 def expmap(x, u, *, k, dim=-1):
