@@ -288,7 +288,7 @@ def norm(u, *, keepdim=False, dim=-1):
 
 @torch.jit.script
 def _norm(u, keepdim: bool = False, dim: int = -1):
-    return torch.sqrt(torch.clamp_min(-_inner(u, u, keepdim=keepdim), 1e-8))
+    return torch.sqrt(torch.clamp_min(_inner(u, u, keepdim=keepdim).abs(), 1e-8))
 
 
 def expmap(x, u, *, k, dim=-1):

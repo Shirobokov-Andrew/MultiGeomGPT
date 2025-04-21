@@ -86,15 +86,31 @@ class FullyHyperbolicBlock(nn.Module):
 
         self.block_curvature = nn.Parameter(torch.tensor(config.curvature))
         self.attn_curvatures = nn.Parameter(torch.ones(1, config.n_heads, 1, 1) * config.curvature)
+
         self.qkv = nn.Linear(config.n_embd + 1, 3 * config.n_embd, bias=False)
         self.attn_proj = nn.Linear((self.config.head_dim + 1) * self.config.n_heads, config.n_embd)
-        self.rotary = Rotary(config.head_dim)
-    
-    def forward(self, x: torch.Tensor):
-        lx = project(x, k=self.block_curvature) # (B, T, n_embd+1)
-        lx = self.attn(lx)
 
-    def attn(self, lx: torch.Tensor):
+        self.rotary = Rotary(config.head_dim)
+
+        self.mlp_expand = nn.Linear(config.n_embd + 1, 4 * (config.n_embd + 1), bias=False)
+        self.act = nn.GELU()
+        self.mlp_shrink = nn.Linear(4 * (config.n_embd + 1), config.n_embd + 1, bias=False)
+
+        self.normalization = nn.LayerNorm(config.n_embd)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x is a tensor from euclidean space
+        """
+        lx = project(x, k=self.block_curvature) # (B, T, n_embd+1)
+        attn_lx = self.attn(self.block_norm(lx)) # (B, T, n_embd+1)
+        lx = self.hyp_skip_connection(lx, attn_lx) # (B, T, n_embd+1)
+        mlp_lx = self.mlp(self.block_norm(lx)) # (B, T, n_embd+1)
+        lx = self.hyp_skip_connection(lx, mlp_lx) # (B, T, n_embd+1)
+
+        return lx
+
+    def attn(self, lx: torch.Tensor) -> torch.Tensor:
         """
         lx is a tensor from hyperboloid
         """
@@ -132,6 +148,41 @@ class FullyHyperbolicBlock(nn.Module):
 
         return attn
 
+    def hyp_skip_connection(self, lx: torch.Tensor,  f_lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid
+        """
+        skipped = lx + f_lx
+        skipped_norm = norm(skipped, keepdim=True)
+        skipped = skipped * torch.sqrt(torch.exp(self.block_curvature)) / skipped_norm
+
+        return skipped
+    
+    def mlp(self, lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid # (B, T, n_embd + 1)
+        """
+        expanded_lx = self.mlp_expand(lx) # (B, T, 4*n_embd + 4)
+        expanded_lx_norm = norm(expanded_lx, keepdim=True)
+        expanded_lx = expanded_lx * torch.sqrt(torch.exp(self.block_curvature)) / expanded_lx_norm
+        expanded_lx_s = expanded_lx.narrow(-1, 1, expanded_lx.shape[-1] - 1) # (B, T, 4*n_embd + 3)
+        expanded_lx = self.act(expanded_lx_s) # (B, T, 4*n_embd + 3)
+        expanded_lx = project(expanded_lx, k=self.block_curvature) # (B, T, 4*n_embd + 4)
+        shrinked_lx = self.mlp_shrink(expanded_lx) # (B, T, n_embd + 1)
+        shrinked_lx_norm = norm(shrinked_lx, keepdim=True)
+        shrinked_lx = shrinked_lx_norm * torch.sqrt(torch.exp(self.block_curvature)) / shrinked_lx_norm
+
+        return shrinked_lx
+    
+    def block_norm(self, lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid
+        """
+        lx_s = lx.narrow(-1, 1, lx.shape[-1] - 1)
+        lx_normed = self.normalization(lx_s)
+        lx = project(lx_normed, k=self.block_curvature)
+
+        return lx
 
 
 if __name__ == "__main__":

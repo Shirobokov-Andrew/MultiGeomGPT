@@ -30,13 +30,6 @@ from utils.muon import Muon
 from prodigyopt import Prodigy
 
 
-config = MultiGeomGPTConfig(multi_geom_block=False)
-model = FullyHyperbolicBlock(config=config)
-x = torch.randn(16, 512, 128)
-# x = torch.randint(low=0, high=config.vocab_size - 1, size=(16, config.context_length))
-result = model(x)
-
-
 def pretty_json(hp):
         json_hp = json.dumps(hp, indent=2)
         return "".join("\t" + line for line in json_hp.splitlines(True))
@@ -260,13 +253,6 @@ for name, param in raw_model.named_parameters():
 
 k_params = head_k_params + attn_k_params
 
-# if model_config.attn_k_lr:
-#     for p in attn_k_params:
-#         p.requires_grad = True
-# else:
-#     for p in attn_k_params:
-#         p.requires_grad = False
-
 # Again logging in master process
 if master_process:
     print(f"learnable k params lengths: head = {len(head_k_params)}, attn = {len(attn_k_params)}")
@@ -275,7 +261,6 @@ if master_process:
 # Configure optimizers
 lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("k" not in name))]
 
-# params = list(raw_model.transformer.h.parameters())
 params = [p for name, p in raw_model.transformer.layers.named_parameters() if (p.requires_grad and ("hyp_curvature" not in name))]
 matrix_params = [p for p in params if p.ndim == 2]
 vector_params = [p for p in params if p.ndim == 1]
@@ -389,10 +374,6 @@ if master_process:
 
     print("Writing logs to: " + os.path.join(logdir, "tensorboard_logs"))
     writer = SummaryWriter(log_dir=os.path.join(logdir, "tensorboard_logs"))
-
-    # config_path = os.path.join(logdir, "config.json")
-    # with open(config_path, "w") as f:
-    #     json.dump(vars(train_config), f, indent=4)
 
     writer.add_text("train_config", pretty_json(vars(train_config)))
     writer.add_text("model_config", pretty_json(vars(model_config)))
