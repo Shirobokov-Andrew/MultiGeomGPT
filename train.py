@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] ="6"
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 import datetime
@@ -22,7 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from transformers import GPT2TokenizerFast, PreTrainedTokenizerFast # type: ignore #
 
-from model.model import MultiGeometryGPT, FullyHyperbolicBlock
+from model.model import MultiGeometryGPT
 from config.train_config import TrainConfig
 from config.model_config import MultiGeomGPTConfig
 from utils.loader import DistributedDataLoader
@@ -31,8 +31,8 @@ from prodigyopt import Prodigy
 
 
 def pretty_json(hp):
-        json_hp = json.dumps(hp, indent=2)
-        return "".join("\t" + line for line in json_hp.splitlines(True))
+    json_hp = json.dumps(hp, indent=2)
+    return "".join("\t" + line for line in json_hp.splitlines(True))
 
 
 def create_run_id(train_config: TrainConfig, model_config: MultiGeomGPTConfig, dataset_name: str, timestamp: datetime.datetime):
@@ -244,7 +244,7 @@ for name, param in raw_model.named_parameters():
             head_k_params.append(param)
         else:
             param.requires_grad = False
-    elif "attn.hyp_curvature" in name:
+    elif "curvature" in name:
         if model_config.attn_k_lr > 0:
             param.requires_grad = True
             attn_k_params.append(param)
@@ -261,7 +261,7 @@ if master_process:
 # Configure optimizers
 lm_head_params = [p for name, p in raw_model.lm_head.named_parameters() if (p.requires_grad and ("k" not in name))]
 
-params = [p for name, p in raw_model.transformer.layers.named_parameters() if (p.requires_grad and ("hyp_curvature" not in name))]
+params = [p for name, p in raw_model.transformer.layers.named_parameters() if (p.requires_grad and ("curvature" not in name))]
 matrix_params = [p for p in params if p.ndim == 2]
 vector_params = [p for p in params if p.ndim == 1]
 wte_params = [raw_model.transformer.wte.weight]
@@ -292,7 +292,7 @@ if len(attn_k_params) > 0 and len(head_k_params) > 0:
     total_params_list += head_k_params
     # optimizers.append(optimizer_k)
     if master_process:
-        print(f"attn.hyp_curvature is learned with lr={model_config.attn_k_lr}")
+        print(f"block curvatures are learned with lr={model_config.attn_k_lr}")
         print(f"lm_head.k is learned with lr={model_config.head_k_lr}")
 
 elif len(attn_k_params) > 0 and len(head_k_params) == 0:
@@ -303,7 +303,7 @@ elif len(attn_k_params) > 0 and len(head_k_params) == 0:
     total_params_list += attn_k_params
     # optimizers.append(optimizer_k)
     if master_process:
-        print(f"attn.hyp_curvature is learned with {model_config.attn_k_lr} lr")
+        print(f"block_curvatures are learned with {model_config.attn_k_lr} lr")
 
 elif len(attn_k_params) == 0 and len(head_k_params) > 0:
     # optimizer_k = torch.optim.SGD([
@@ -317,7 +317,7 @@ elif len(attn_k_params) == 0 and len(head_k_params) > 0:
 
 else:
     if master_process:
-        print(f"attn.hyp_curvature and lm_head.k are not learned")
+        print(f"block curvatures and lm_head.k are not learned")
 
 optimizers = [Prodigy(total_params_list, lr=1., use_bias_correction=True, weight_decay=0.0)]
 

@@ -23,7 +23,6 @@ class Rotary(nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
             freqs = torch.outer(t, self.inv_freq).to(x.device)
-            # emb = torch.cat((freqs, freqs), dim=-1)
             self.cos_cached = freqs.cos()[None, :, None, :].bfloat16()
             self.sin_cached = freqs.sin()[None, :, None, :].bfloat16()
         return self.cos_cached, self.sin_cached
@@ -41,7 +40,8 @@ def custom_attention(
         value: torch.Tensor,
         dropout: nn.Dropout = None,
         curvature: float = None, 
-        mode: str = 'euc', 
+        mode: str = "euc", 
+        hyp_attn_weight: str = "neg_dis",
         scale: float = None, 
         ) -> torch.Tensor:
     if mode == "euc":
@@ -59,204 +59,75 @@ def custom_attention(
         lq = project(query, k=curvature).unsqueeze(-2)
         lk = project(key, k=curvature).unsqueeze(-3)
         dis = distance(lq, lk, k=curvature)
-        attn_weight = query.shape[-1] ** (0.5) / (1e-6 + dis)
+        if hyp_attn_weight == "inverse_dis":
+            attn_weight = query.shape[-1] ** (0.5) / (1e-6 + dis)
+        elif hyp_attn_weight == "neg_dis":
+            attn_weight = -dis
 
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         if dropout is not None:
             attn_weight = dropout(attn_weight)
         return attn_weight @ value
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-
-    def forward(self, x):
-        norm = torch.norm(x, p=2, dim=-1, keepdim=True) * (x.size(-1) ** -0.5)
-        return x / (norm + self.eps) * self.weight
-
-
-class FullyHyperbolicBlock(nn.Module):
-    def __init__(self, config: MultiGeomGPTConfig):
-        super().__init__()
-        self.config = config
-
-        self.block_curvature = nn.Parameter(torch.tensor(config.curvature))
-        self.attn_curvatures = nn.Parameter(torch.ones(1, config.n_heads, 1, 1) * config.curvature)
-
-        self.qkv = nn.Linear(config.n_embd + 1, 3 * config.n_embd, bias=False)
-        self.attn_proj = nn.Linear((self.config.head_dim + 1) * self.config.n_heads, config.n_embd)
-
-        self.rotary = Rotary(config.head_dim)
-
-        self.mlp_expand = nn.Linear(config.n_embd + 1, 4 * (config.n_embd + 1), bias=False)
-        self.act = nn.GELU()
-        self.mlp_shrink = nn.Linear(4 * (config.n_embd + 1), config.n_embd + 1, bias=False)
-
-        self.normalization = nn.LayerNorm(config.n_embd)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x is a tensor from euclidean space
-        """
-        lx = project(x, k=self.block_curvature) # (B, T, n_embd+1)
-        attn_lx = self.attn(self.block_norm(lx)) # (B, T, n_embd+1)
-        lx = self.hyp_skip_connection(lx, attn_lx) # (B, T, n_embd+1)
-        mlp_lx = self.mlp(self.block_norm(lx)) # (B, T, n_embd+1)
-        lx = self.hyp_skip_connection(lx, mlp_lx) # (B, T, n_embd+1)
-
-        return lx
-
-    def attn(self, lx: torch.Tensor) -> torch.Tensor:
-        """
-        lx is a tensor from hyperboloid
-        """
-        B, T, C = lx.shape[0], lx.shape[1], lx.shape[2]
-        # calculate q, k, v from hyperbolic vector and map them to another hyperboloid
-        qkv = self.qkv(lx).split(C - 1, dim=2) # here C==n_embd+1, since lx is hyperbolic
-        q, k, v = [x.view(B, T, self.config.n_heads, self.config.head_dim) for x in qkv] # (B, T, num_heads, head_dim)
-        cos, sin = self.rotary(q)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-
-        lq = project(q.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-2) # (B, num_heads, T, 1, head_dim+1) # unsqueeze to calculate pairwise distance
-        lk = project(k.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-3) # (B, num_heads, 1, T, head_dim+1)
-        lv = project(v.transpose(1, 2), k=self.attn_curvatures) # (B, num_heads, T, head_dim+1)
-
-        attn_bias = torch.zeros(T, T, dtype=lq.dtype, device=lq.device)
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=lq.device), diagonal=1)
-        attn_bias.masked_fill_(mask, float('-inf'))
-
-        # attn matrix is an determined by the inverse geodesic distance on hyperboloid
-        dis = distance(lq, lk, k=self.attn_curvatures) # (B, num_heads, T, T)
-        attn_weight = lq.shape[-1] ** (0.5) / (1e-6 + dis)
-        attn_weight += attn_bias
-        attn_weight = torch.softmax(attn_weight, dim=-1) # (B, num_heads, T, T)
-
-        # we need to renormalize attention in order to get vector on the initial attn hyperboloid
-        attn = attn_weight @ lv  # (B, num_heads, T, head_dim+1)
-        attn_hyp_norm = norm(attn, keepdim=True)
-        attn = attn * torch.sqrt(torch.exp(self.attn_curvatures)) / attn_hyp_norm
-        attn = attn.transpose(1, 2).contiguous().view(B, T, (self.config.head_dim + 1) * self.config.n_heads)
-
-        # project from attention hyperboloids to euc space and back to block hyperboloid
-        attn = self.attn_proj(attn)
-        attn = project(attn, k=self.block_curvature) # (B, T, n_embd+1)
-
-        return attn
-
-    def hyp_skip_connection(self, lx: torch.Tensor,  f_lx: torch.Tensor) -> torch.Tensor:
-        """
-        lx is a tensor from hyperboloid
-        """
-        skipped = lx + f_lx
-        skipped_norm = norm(skipped, keepdim=True)
-        skipped = skipped * torch.sqrt(torch.exp(self.block_curvature)) / skipped_norm
-
-        return skipped
-    
-    def mlp(self, lx: torch.Tensor) -> torch.Tensor:
-        """
-        lx is a tensor from hyperboloid # (B, T, n_embd + 1)
-        """
-        expanded_lx = self.mlp_expand(lx) # (B, T, 4*n_embd + 4)
-        expanded_lx_norm = norm(expanded_lx, keepdim=True)
-        expanded_lx = expanded_lx * torch.sqrt(torch.exp(self.block_curvature)) / expanded_lx_norm
-        expanded_lx_s = expanded_lx.narrow(-1, 1, expanded_lx.shape[-1] - 1) # (B, T, 4*n_embd + 3)
-        expanded_lx = self.act(expanded_lx_s) # (B, T, 4*n_embd + 3)
-        expanded_lx = project(expanded_lx, k=self.block_curvature) # (B, T, 4*n_embd + 4)
-        shrinked_lx = self.mlp_shrink(expanded_lx) # (B, T, n_embd + 1)
-        shrinked_lx_norm = norm(shrinked_lx, keepdim=True)
-        shrinked_lx = shrinked_lx_norm * torch.sqrt(torch.exp(self.block_curvature)) / shrinked_lx_norm
-
-        return shrinked_lx
-    
-    def block_norm(self, lx: torch.Tensor) -> torch.Tensor:
-        """
-        lx is a tensor from hyperboloid
-        """
-        lx_s = lx.narrow(-1, 1, lx.shape[-1] - 1)
-        lx_normed = self.normalization(lx_s)
-        lx = project(lx_normed, k=self.block_curvature)
-
-        return lx
-
-
-if __name__ == "__main__":
-    config = MultiGeomGPTConfig(multi_geom_block=False)
-    model = FullyHyperbolicBlock(config=config)
-    x = torch.randint(low=0, high=config.vocab_size - 1, size=(16, config.context_length))
-    result = model(x)
         
 
 class MultiGeometryAttention(nn.Module):
     def __init__(self, config: MultiGeomGPTConfig):
         super().__init__()
-        self.n_heads = config.n_heads
-        self.learn_x0 = config.learn_x0
         self.config = config
-        self.n1 = config.n1  # number of Euclidean heads
-        self.n2 = config.n2  # number of Hyperbolic heads
-        self.n3 = config.n3  # number of Spherical heads
-        self.head_dim = config.n_embd // config.n_heads
-        # self.dropout = config.dropout
         self.attn_dropout = nn.Dropout(p=config.dropout)
         self.resid_dropout = nn.Dropout(p=config.dropout)
-        assert self.n1 + self.n2 + self.n3 == self.n_heads
 
         self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.proj = nn.Linear(config.n_embd, config.n_embd)
-        self.rotary = Rotary(self.head_dim)
+        self.rotary = Rotary(config.head_dim)
     
-        if self.n2 > 0:
+        if self.config.n2 > 0:
             self.init_hyperbolic_params()
 
     def init_hyperbolic_params(self):
         if self.config.attn_k_lr:
             self.hyp_curvature = nn.Parameter(
-                torch.full((1, self.n2, 1, 1), self.config.curvature))
-            # x = torch.randn(1, self.n2, 1, 1, device=self.qkv.weight.device)
-            # init_k = torch.exp(x) * config.curvature
+                torch.full((1, self.config.n2, 1, 1), self.config.curvature))
+            # x = torch.randn(1, self.config.n2, 1, 1, device=self.qkv.weight.device)
+            # init_k = torch.exp(x) * self.config.curvature
             # self.hyp_curvature = nn.Parameter(init_k)
         else:
             self.register_buffer('hyp_curvature',
-                                    torch.full((1, self.n2, 1, 1), self.config.curvature))
-        if self.learn_x0:
-            self.x0_norm_proj = nn.Linear(self.head_dim, 1)
+                                    torch.full((1, self.config.n2, 1, 1), self.config.curvature))
+        if self.config.learn_x0:
+            self.x0_norm_proj = nn.Linear(self.config.head_dim, 1)
             if self.config.init_x0_uniform:
-                nn.init.uniform_(self.x0_norm_proj.weight, a=-(self.head_dim ** 0.5), b=self.head_dim ** 0.5)
-                nn.init.uniform_(self.x0_norm_proj.bias, a=-(self.head_dim ** 0.5), b=self.head_dim ** 0.5)
+                nn.init.uniform_(self.x0_norm_proj.weight, a=-(self.config.head_dim ** 0.5), b=self.config.head_dim ** 0.5)
+                nn.init.uniform_(self.x0_norm_proj.bias, a=-(self.config.head_dim ** 0.5), b=self.config.head_dim ** 0.5)
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
         qkv = self.qkv(x).split(C, dim=2)
-        q, k, v = [x.view(B, T, self.n_heads, self.head_dim) for x in qkv]
+        q, k, v = [x.view(B, T, self.config.n_heads, self.config.head_dim) for x in qkv]
 
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        split_sizes = [self.n1, self.n2, self.n3]
+        split_sizes = [self.config.n1, self.config.n2, self.config.n3]
         qs = torch.split(q, split_sizes, dim=2)
         ks = torch.split(k, split_sizes, dim=2)
         vs = torch.split(v, split_sizes, dim=2)
 
         outputs = []
-        if self.n1 > 0:
+        if self.config.n1 > 0:
             attn = custom_attention(
                 qs[0].transpose(1, 2), 
                 ks[0].transpose(1, 2), 
                 vs[0].transpose(1, 2), 
                 mode='euc', 
                 dropout=self.attn_dropout, 
-                scale=1 / math.sqrt(self.head_dim),
+                scale=1 / math.sqrt(self.config.head_dim),
                 )
             outputs.append(attn.transpose(1, 2))
-        if self.n2 > 0:
-            if self.learn_x0:
+        if self.config.n2 > 0:
+            if self.config.learn_x0:
                 if self.config.init_x0_uniform:
                     q_norms = self.x0_norm_proj(qs[1]) ** 2
                     k_norms = self.x0_norm_proj(ks[1]) ** 2
@@ -277,16 +148,17 @@ class MultiGeometryAttention(nn.Module):
                 curvature=self.hyp_curvature, 
                 mode='hyp', 
                 dropout=self.attn_dropout,
+                hyp_attn_weight=self.config.hyp_attn_weight,
                 )
             outputs.append(attn.transpose(1, 2))
-        if self.n3 > 0:
+        if self.config.n3 > 0:
             attn = custom_attention(
                 qs[2].transpose(1, 2), 
                 ks[2].transpose(1, 2), 
                 vs[2].transpose(1, 2), 
                 mode='sph', 
                 dropout=self.attn_dropout, 
-                scale=math.sqrt(self.head_dim),
+                scale=math.sqrt(self.config.head_dim),
                 )
             outputs.append(attn.transpose(1, 2))
 
@@ -297,9 +169,7 @@ class MultiGeometryAttention(nn.Module):
 class MultiGeometryBlock(nn.Module):
     def __init__(self, config: MultiGeomGPTConfig):
         super().__init__()
-        # self.ln1 = RMSNorm(config.n_embd)
         self.attn = MultiGeometryAttention(config)
-        # self.ln2 = RMSNorm(config.n_embd)
         self.mlp = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd),
             nn.GELU(),
@@ -308,8 +178,6 @@ class MultiGeometryBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        # x = x + self.attn(self.ln1(x))
-        # x = x + self.mlp(self.ln2(x))
         x = x + self.attn(F.rms_norm(x, (x.size(-1),)))
         x = x + self.mlp(F.rms_norm(x, (x.size(-1),)))
         return x
@@ -322,40 +190,39 @@ class JointGeometryMLP(nn.Module):
         """
         super().__init__()
         self.geom_type = geom_type
-        self.n_embd = config.n_embd
         self.config = config
+        use_bias = False if geom_type == "sph" else True
 
-        if self.config.use_mlp_swiglu:
-            self.uv_proj = nn.Linear(self.n_embd, 2 * 4 * self.n_embd, bias=False)
+        if config.use_mlp_swiglu:
+            self.uv_proj = nn.Linear(config.n_embd, 2 * 4 * config.n_embd, bias=use_bias)
             self.act = nn.SiLU()
-            self.out_proj = nn.Linear(4 * self.n_embd, self.n_embd, bias=False)
+            self.out_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=use_bias)
         else:
-            self.expand_proj = nn.Linear(self.n_embd, 4 * self.n_embd)
+            self.expand_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=use_bias)
             self.act = nn.GELU()
-            self.shrink_proj = nn.Linear(4 * self.n_embd, self.n_embd)
+            self.shrink_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=use_bias)
 
-        if geom_type == "sph" and self.config.use_mlp_swiglu:
+        if geom_type == "sph" and config.use_mlp_swiglu:
             self._init_spherical_params()
 
     def _init_spherical_params(self):
         self.init_value = 1.0
         self.init_scaling = 1.0
-        self.suv = nn.Parameter(self.init_scaling * torch.ones(2 * 4 * self.n_embd,))
+        self.suv = nn.Parameter(self.init_scaling * torch.ones(2 * 4 * self.config.n_embd,))
     
     def forward(self, x: torch.Tensor):
         if self.config.use_mlp_swiglu:
             uv = self.uv_proj(x)
             if self.geom_type == "sph":
-                scaling = (self.init_value / self.init_scaling) * (self.n_embd ** 0.5)
+                scaling = (self.init_value / self.init_scaling) * (self.config.n_embd ** 0.5)
                 uv = self.suv * scaling * uv
-
             u, v = torch.chunk(uv, 2, dim=-1)
             h = u * self.act(v)
             h = self.out_proj(h)
         else:
             h = self.expand_proj(x)
             h = self.act(h)
-            h = self.shrink_proj() 
+            h = self.shrink_proj(h) 
 
         return h
 
@@ -368,14 +235,10 @@ class JointGeometryAttention(nn.Module):
         super().__init__()
         self.config = config
         self.geom_type = geom_type
-        self.n_heads = config.n_heads
-        self.head_dim = config.head_dim
-        self.n_embd = config.n_embd
-        self.learn_x0 = config.learn_x0
 
-        self.qkv = nn.Linear(self.n_embd, 3 * self.n_embd, bias=False)
-        self.out_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.rotary = Rotary(self.head_dim)
+        self.qkv = nn.Linear(config.n_embd, 3 * config.head_dim * config.n_heads, bias=False)
+        self.out_proj = nn.Linear(config.head_dim * config.n_heads, config.n_embd, bias=False)
+        self.rotary = Rotary(config.head_dim)
 
         if geom_type == "hyp":
             self._init_hyperbolic_params()
@@ -384,46 +247,46 @@ class JointGeometryAttention(nn.Module):
 
     def _init_hyperbolic_params(self):
         if self.config.attn_k_lr:
-            x = torch.randn(1, self.n_heads, 1, 1, device=self.qkv.weight.device)
+            x = torch.randn(1, self.config.n_heads, 1, 1, device=self.qkv.weight.device)
             init_k = torch.exp(x) * self.config.curvature
             self.hyp_curvature = nn.Parameter(init_k)
         else:
-            x = torch.randn(1, self.n_heads, 1, 1, device=self.qkv.weight.device)
+            x = torch.randn(1, self.config.n_heads, 1, 1, device=self.qkv.weight.device)
             fixed_k = torch.exp(x) * self.config.curvature
             self.register_buffer('hyp_curvature', fixed_k)
-        if self.learn_x0:
-            self.x0_norm_proj = nn.Linear(self.head_dim, 1)
+        if self.config.learn_x0:
+            self.x0_norm_proj = nn.Linear(self.config.head_dim, 1)
     
     def _init_spherical_params(self):
         self.sqk_init_value = 1.0
-        self.sqk_init_scaling = 1.0 / (self.n_embd ** 0.5)
-        self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(self.n_embd, dtype=torch.float32))
+        self.sqk_init_scaling = 1.0 / (self.config.config.n_embd ** 0.5)
+        self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
         qkv = self.qkv(x).split(C, dim=2)
-        q, k, v = [t.view(B, T, self.n_heads, self.head_dim) for t in qkv]
+        q, k, v = [t.view(B, T, self.config.n_heads, self.config.head_dim) for t in qkv]
 
         cos, sin = self.rotary(q)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
         # get learnable time component in Lorentz model
-        if self.geom_type == "hyp" and self.learn_x0:
+        if self.geom_type == "hyp" and self.config.learn_x0:
             q_norms = self.x0_norm_proj(q) ** 2
             k_norms = self.x0_norm_proj(k) ** 2
             q = q_norms * F.normalize(q, dim=-1)
             k = k_norms * F.normalize(k, dim=-1)
 
         if self.geom_type == "euc":
-            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=1 / (self.n_embd ** 0.5))
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=1 / (self.config.head_dim ** 0.5))
         elif self.geom_type == "hyp":
-            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="hyp", curvature=self.hyp_curvature)
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="hyp", curvature=self.hyp_curvature, hyp_attn_weight=self.config.hyp_attn_weight)
         elif self.geom_type == "sph":
-            sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.n_heads, self.head_dim)
+            sqk = (self.sqk * (self.sqk_init_value / self.sqk_init_scaling)).view(1, 1, self.config.n_heads, self.config.head_dim)
             q = sqk * F.normalize(q, p=2.0, dim=-1)
             k = sqk * F.normalize(k, p=2.0, dim=-1)
-            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=self.n_embd ** 0.5)
+            attn = custom_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), mode="euc", scale=self.config.head_dim ** 0.5)
 
         attn = attn.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -438,8 +301,8 @@ class JointGeometryBlock(nn.Module):
         super().__init__()
         assert geom_type in ["sph", "hyp", "euc"], f"Unknown geometry was given: {geom_type}"
 
+        self.config = config
         self.geom_type = geom_type
-        self.n_embd = config.n_embd
 
         self.attn = JointGeometryAttention(config, geom_type)
         self.mlp = JointGeometryMLP(config, geom_type)
@@ -449,18 +312,28 @@ class JointGeometryBlock(nn.Module):
 
     def _init_spherical_params(self):
         self.attn_alpha_init_value = 0.05
-        self.attn_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
-        self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.n_embd))
+        self.attn_alpha_init_scaling = 1.0 / (self.config.n_embd ** 0.5)
+        self.attn_alpha = nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.config.n_embd))
 
         self.mlp_alpha_init_value = 0.05
-        self.mlp_alpha_init_scaling = 1.0 / (self.n_embd ** 0.5)
-        self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.n_embd))
+        self.mlp_alpha_init_scaling = 1.0 / (self.config.n_embd ** 0.5)
+        self.mlp_alpha = nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.config.n_embd))
 
     def forward(self, x: torch.Tensor):
+        """
+        x can be hyp/euc/sph tensor
+        """
+        if x.shape[-1] == self.config.n_embd:
+            x = x
+        elif x.shape[-1] == self.config.n_embd + 1:
+            x = x.narrow(-1, 1, x.shape[-1] - 1)
+        else:
+            raise ValueError(f"input x has invalid vector dimension: {x.shape[-1]}")
+
         if self.geom_type in ["euc", "hyp"]:
             h = F.rms_norm(x, (x.size(-1),))
         else:
-            h = x
+            h = F.normalize(x, p=2.0, dim=-1)
 
         h_attn = self.attn(h)
 
@@ -496,18 +369,134 @@ class JointGeometryBlock(nn.Module):
         return F.normalize(A_norm + lr * (B_norm - A_norm), p=2.0, dim=-1)
 
 
-class LorentzMLR(nn.Module):
-    """ Multinomial logistic regression (MLR) in the Lorentz model
-    """
-
-    def __init__(self,config: MultiGeomGPTConfig):
+class FullyHyperbolicBlock(nn.Module):
+    def __init__(self, config: MultiGeomGPTConfig, geom_type: str = "hyp"):
         super().__init__()
-        if config.head_k_lr > 0:
-            self.k = nn.Parameter(torch.tensor(config.curvature))
+        self.config = config
+        self.geom_type = geom_type
+
+        self.block_curvature = nn.Parameter(torch.tensor(config.curvature))
+        self.mlp_curvature = nn.Parameter(torch.tensor(config.curvature))
+        self.attn_curvatures = nn.Parameter(torch.ones(1, config.n_heads, 1, 1) * config.curvature)
+
+        self.qkv = nn.Linear(config.n_embd + 1, 3 * config.n_embd, bias=False)
+        self.attn_proj = nn.Linear((config.head_dim + 1) * config.n_heads, config.n_embd)
+
+        self.rotary = Rotary(config.head_dim)
+
+        self.mlp_expand = nn.Linear(config.n_embd + 1, 4 * config.n_embd + 3)
+        self.act = nn.ReLU()
+        self.mlp_shrink = nn.Linear(4 * (config.n_embd + 1), config.n_embd)
+
+        # self.normalization = nn.LayerNorm(config.n_embd)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x can be hyp/euc/sph tensor
+        """
+        if x.shape[-1] == self.config.n_embd:
+            lx = project(x, k=self.block_curvature) # map euc/sph input to block hyperboloid (B, T, n_embd + 1)
+        elif x.shape[-1] == self.config.n_embd + 1:
+            x_norm = norm(x, keepdim=True) # map hyp input x to block hyperboloid (B, T, n_embd + 1)
+            lx = x * torch.sqrt(torch.exp(self.block_curvature)) / x_norm
         else:
-            self.register_buffer('k', torch.tensor(config.curvature))
-        self.a = torch.nn.Parameter(torch.zeros(config.vocab_size, ))  # optimize properly
-        self.z = torch.nn.Parameter(F.pad(torch.zeros(config.vocab_size, config.n_embd - 2), pad=(1, 0), value=1)) # (vocab_size, n_embd-1)
+            raise ValueError(f"input x has invalid vector dimension: {x.shape[-1]}")
+
+        attn_lx = self.attn(self.block_norm(lx)) # (B, T, n_embd+1)
+        lx = self.hyp_skip_connection(lx, attn_lx) # (B, T, n_embd+1)
+        mlp_lx = self.mlp(self.block_norm(lx)) # (B, T, n_embd+1)
+        lx = self.hyp_skip_connection(lx, mlp_lx) # (B, T, n_embd+1)
+
+        return lx
+
+    def attn(self, lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid (B, T, n_embd + 1)
+        """
+        B, T, C = lx.shape[0], lx.shape[1], lx.shape[2]
+        # calculate q, k, v from hyperbolic vector and map them to another hyperboloid
+        qkv = self.qkv(lx).split(C - 1, dim=2) # here C==n_embd+1, since lx is hyperbolic
+        q, k, v = [x.view(B, T, self.config.n_heads, self.config.head_dim) for x in qkv] # (B, T, num_heads, head_dim)
+        cos, sin = self.rotary(q)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
+
+        lq = project(q.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-2) # (B, num_heads, T, 1, head_dim+1) # unsqueeze to calculate pairwise distance
+        lk = project(k.transpose(1, 2), k=self.attn_curvatures).unsqueeze(-3) # (B, num_heads, 1, T, head_dim+1)
+        lv = project(v.transpose(1, 2), k=self.attn_curvatures) # (B, num_heads, T, head_dim+1)
+
+        attn_bias = torch.zeros(T, T, dtype=lq.dtype, device=lq.device)
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=lq.device), diagonal=1)
+        attn_bias.masked_fill_(mask, float('-inf'))
+
+        # attn matrix is an determined by the inverse geodesic distance on hyperboloid
+        dis = distance(lq, lk, k=self.attn_curvatures) # (B, num_heads, T, T)
+        if self.config.hyp_attn_weight == "inverse_dis":
+            attn_weight = lq.shape[-1] ** (0.5) / (1e-6 + dis)
+        elif self.config.hyp_attn_weight == "neg_dis":
+            attn_weight = -dis
+        attn_weight += attn_bias
+        attn_weight = torch.softmax(attn_weight, dim=-1) # (B, num_heads, T, T)
+
+        # we need to renormalize attention in order to get vector on the initial attn hyperboloid
+        attn = attn_weight @ lv  # (B, num_heads, T, head_dim+1)
+        attn_hyp_norm = norm(attn, keepdim=True)
+        attn = attn * torch.sqrt(torch.exp(self.attn_curvatures)) / attn_hyp_norm
+        attn = attn.transpose(1, 2).contiguous().view(B, T, (self.config.head_dim + 1) * self.config.n_heads)
+
+        # project from attention hyperboloids to euc space and back to block hyperboloid
+        attn = self.attn_proj(attn)
+        attn = project(attn, k=self.block_curvature) # (B, T, n_embd+1)
+
+        return attn
+
+    def hyp_skip_connection(self, lx: torch.Tensor,  f_lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx and f_lx are tensors from hyperboloid (B, T, n_embd + 1)
+        """
+        skipped = lx + f_lx
+        skipped_norm = norm(skipped, keepdim=True)
+        skipped = skipped * torch.sqrt(torch.exp(self.block_curvature)) / skipped_norm
+
+        return skipped
+    
+    def mlp(self, lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid (B, T, n_embd + 1)
+        """
+        lx = self.mlp_expand(lx) # (B, T, 4*n_embd + 3)
+        lx = project(lx, k=self.mlp_curvature) # (B, T, 4*n_embd + 4)
+        lx = lx.narrow(-1, 1, lx.shape[-1] - 1) # (B, T, 4*n_embd + 3)
+        lx = self.act(lx) # (B, T, 4*n_embd + 3)
+        lx = project(lx, k=self.mlp_curvature) # (B, T, 4*n_embd + 4)
+        lx = self.mlp_shrink(lx) # (B, T, n_embd)
+        lx = project(lx, k=self.block_curvature) # (B, T, n_embd + 1)
+
+        return lx
+    
+    def block_norm(self, lx: torch.Tensor) -> torch.Tensor:
+        """
+        lx is a tensor from hyperboloid (B, T, n_embd + 1)
+        """
+        lx = lx.narrow(-1, 1, lx.shape[-1] - 1)
+        lx = F.rms_norm(lx, (lx.size(-1),))
+        # lx_normed = self.normalization(lx_s)
+        lx = project(lx, k=self.block_curvature)
+
+        return lx
+
+
+class LorentzMLR(nn.Module):
+    """ Multinomial logistic regression (MLR) in the Lorentz model"""
+
+    def __init__(self, head_k_lr: float, init_k: float, vocab_size: int, n_embd: int):
+        super().__init__()
+        if head_k_lr > 0:
+            self.k = nn.Parameter(torch.tensor(init_k))
+        else:
+            self.register_buffer('k', torch.tensor(init_k))
+        self.a = torch.nn.Parameter(torch.zeros(vocab_size, ))  # optimize properly
+        self.z = torch.nn.Parameter(F.pad(torch.zeros(vocab_size, n_embd - 2), pad=(1, 0), value=1)) # (vocab_size, n_embd-1)
 
         self.init_weights()
 
@@ -515,6 +504,7 @@ class LorentzMLR(nn.Module):
         # x: (B, T, num_features)
 
         # Hyperplane parameters
+        # x = project(x, k=self.k)
         sqrt_mK = 1 / self.k.sqrt()  # scalar
         norm_z = torch.norm(self.z, dim=-1)  # (vocab_size,)
         w_t = torch.sinh(sqrt_mK * self.a) * norm_z  # (vocab_size,)
@@ -543,6 +533,7 @@ class MultiGeometryGPT(nn.Module):
     def __init__(self, config: MultiGeomGPTConfig):
         super().__init__()
         self.config = config
+
         wte = nn.Embedding(config.vocab_size, config.n_embd)
 
         if config.multi_geom_block:
@@ -550,23 +541,33 @@ class MultiGeometryGPT(nn.Module):
         else:
             geom_dict = {"euc": config.n_euc_layers, "hyp": config.n_hyp_layers, "sph": config.n_sph_layers}
             layers_list = []
+            self.layers_geoms = []
+
             for geom_type in config.layers_order:
                 n_layers = geom_dict[geom_type]
-                layers_list.extend([JointGeometryBlock(config, geom_type) for _ in range(n_layers)])
+                for _ in range(n_layers):
+                    self.layers_geoms.append(geom_type)
+                if geom_type == "hyp" and config.use_fully_hyp_block:
+                    layers_list.extend([FullyHyperbolicBlock(config) for _ in range(n_layers)])
+                else:
+                    layers_list.extend([JointGeometryBlock(config, geom_type) for _ in range(n_layers)])
+            
             layers = nn.ModuleList(layers_list)
 
-        self.transformer = nn.ModuleDict(dict(
-            wte=wte,
-            layers=layers
-        ))
-        
+        self.transformer = nn.ModuleDict(dict(wte=wte, layers=layers))
+
+        if isinstance(layers_list[-1], FullyHyperbolicBlock):
+            n_embd = config.n_embd + 1
+        else:
+            n_embd = config.n_embd
+
         if config.lm_head_mode == 'euc':
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+            self.lm_head = nn.Linear(n_embd, config.vocab_size)
             self._init_weights(self.lm_head)
         elif config.lm_head_mode == 'hyp':
-            self.lm_head = LorentzMLR(config)
+            self.lm_head = LorentzMLR(config.head_k_lr, config.curvature, config.vocab_size, n_embd)
         elif config.lm_head_mode == 'sph':
-            self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
+            self.lm_head = nn.Linear(n_embd, config.vocab_size)
             self._init_weights(self.lm_head)
 
     @staticmethod
@@ -577,14 +578,15 @@ class MultiGeometryGPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
-        B, T = idx.size()
         x = self.transformer.wte(idx)
-        x = F.rms_norm(x, (x.size(-1),))
 
-        for block in self.transformer.layers:
+        for i, block in enumerate(self.transformer.layers):
             x = block(x)
-
-        # x = self.transformer.ln_f(x)
+        
+        # if the last layer is fully hyperbolic we have to reduce dimension by 1 to get n_embd dimension
+        # if x.shape[-1] == self.config.n_embd + 1:
+        #     x = x.narrow(-1, 1, x.shape[-1] - 1)
+        
         x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
@@ -602,8 +604,12 @@ class MultiGeometryGPT(nn.Module):
                 layer.attn.qkv.weight.data.copy_(F.normalize(layer.attn.qkv.weight.data, p=2.0, dim=-1))
                 layer.attn.out_proj.weight.data.copy_(F.normalize(layer.attn.out_proj.weight.data, p=2.0, dim=-1))
 
-                layer.mlp.uv_proj.weight.data.copy_(F.normalize(layer.mlp.uv_proj.weight.data, p=2.0, dim=-1))
-                layer.mlp.out_proj.weight.data.copy_(F.normalize(layer.mlp.out_proj.weight.data, p=2.0, dim=-1))
+                if self.config.use_mlp_swiglu:
+                    layer.mlp.uv_proj.weight.data.copy_(F.normalize(layer.mlp.uv_proj.weight.data, p=2.0, dim=-1))
+                    layer.mlp.out_proj.weight.data.copy_(F.normalize(layer.mlp.out_proj.weight.data, p=2.0, dim=-1))
+                else:
+                    layer.mlp.expand_proj.weight.data.copy_(F.normalize(layer.mlp.expand_proj.weight.data, p=2.0, dim=-1))
+                    layer.mlp.shrink_proj.weight.data.copy_(F.normalize(layer.mlp.shrink_proj.weight.data, p=2.0, dim=-1))
 
     def generate(self, context: torch.Tensor, max_length: int, temperature: float = 1.0, top_k: int = None):
         self.eval()

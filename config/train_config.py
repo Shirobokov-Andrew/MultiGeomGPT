@@ -30,7 +30,7 @@ class TrainConfig:
     val_loss_every: int = 50    # Calculate validation loss every N steps
     generate_every: int = 500    # Generate samples every N steps
     gradient_log_every: int = 500 # Log gradient statistics every N steps
-    save_every: int = 500 # Save checkpoint
+    save_every: int = 50000 # Save checkpoint
 
     # Generation parameters
     generation_temp: float = 0.8    # Temperature for sampling
