@@ -27,7 +27,7 @@ class MultiGeomGPTConfig:
     n_hyp_layers: int = 6 # number of fully hyp transformer layers (relevant only when multi_geom_block == False)
     n_sph_layers: int = 0 # number of fully sph transformer layers (relevant only when multi_geom_block == False)
 
-    lm_head_mode: str = 'hyp'
+    lm_head_mode: str = 'euc'
     curvature: float = 1.0 # initial curvature in hyperbolic modules (attention and/or lm_head)
     context_length: int = context_length
 
@@ -38,7 +38,7 @@ class MultiGeomGPTConfig:
     attn_k_lr: float = 0.01
     head_k_lr: float = 0.01
     head_lr: float = 0.002
-    wte_lr: float = 0.02
+    wte_lr: float = 0.05
     matrix_lr: float = 0.0005
     vector_lr: float = 0.0005
 

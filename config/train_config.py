@@ -13,7 +13,7 @@ class TrainConfig:
 
     # Training setup
     device: str = "cuda:0" # used only w/o DDP
-    device_batch_size: int = 32
+    device_batch_size: int = 16
     global_batch_size: int = 8 * 16 # global batch size must be divisible to (device_batch_size * ddp_world_size) in order to perfrom grad accumulation steps
     # global_batch_size: int = 252 # for 6 devices
     num_iterations: int = 10000

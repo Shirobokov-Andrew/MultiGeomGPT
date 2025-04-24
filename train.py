@@ -2,7 +2,7 @@ import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import time
 import datetime
@@ -273,7 +273,7 @@ optimizer_matrix = torch.optim.Adam(matrix_params, lr=model_config.matrix_lr, be
 
 opt = Prodigy(lm_head_params + wte_params + matrix_params, lr=1., use_bias_correction=True, weight_decay=0.0)
 optimizers = [optimizer_head, optimizer_matrix, optimizer_wte]
-total_params_list = lm_head_params + wte_params + matrix_params
+total_params_list = lm_head_params + matrix_params
 if len(vector_params) > 0:
     optimizer_vector = torch.optim.Adam(vector_params, lr=model_config.vector_lr, betas=(0.9, 0.999), eps=1e-10, fused=True)
     optimizers.append(optimizer_vector)
@@ -319,7 +319,8 @@ else:
     if master_process:
         print(f"block curvatures and lm_head.k are not learned")
 
-optimizers = [Prodigy(total_params_list, lr=1., use_bias_correction=True, weight_decay=0.0)]
+optimizers = [torch.optim.Adam(wte_params, lr=model_config.wte_lr, betas=(0.9, 0.999), eps=1e-10, fused=True), Prodigy(total_params_list, lr=1., use_bias_correction=True, weight_decay=0.0)]
+# optimizers = [torch.optim.Adam(total_params_list, lr=model_config.matrix_lr, betas=(0.9, 0.999), eps=1e-10, fused=True, weight_decay=0.005)]
 
 # Configure schedulers
 def get_lr(it):
@@ -547,6 +548,13 @@ for step in tqdm(range(train_config.num_iterations + 1)):
         print(f"Step: {step}, grad_norm/attn_k", grad_norm_attn_k)
         if len(vector_params) > 0:
             print(f"Step: {step}, grad_norm/vector", grad_norm_vector)
+        print("=" * 72)
+        grad_norm_wte = compute_grad_norm(raw_model.transformer.wte.parameters())
+        print(f"Grad norm wte: {grad_norm_wte}")
+        for i in range(len(raw_model.transformer.layers)):
+            grad_norm_layer = compute_grad_norm(raw_model.transformer.layers[i].parameters())
+            print(f"Grad norm layer {i}: {grad_norm_layer}")
+        
 
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):

@@ -75,7 +75,7 @@ def inner0(v, *, k, keepdim=False, dim=-1):
 
 @torch.jit.script
 def _inner0(v, k: torch.Tensor, keepdim: bool = False, dim: int = -1):
-    res = -v.narrow(dim, 0, 1) * torch.sqrt(k)
+    res = -v.narrow(dim, 0, 1) * torch.sqrt(torch.exp(k))
     if keepdim is False:
         res = res.squeeze(dim)
     return res
@@ -144,7 +144,7 @@ def dist0(x, *, k, keepdim=False, dim=-1):
 @torch.jit.script
 def _dist0(x, k: torch.Tensor, keepdim: bool = False, dim: int = -1):
     d = -_inner0(x, k=k, dim=dim, keepdim=keepdim)
-    return torch.sqrt(k) * arcosh(d / k)
+    return torch.sqrt(torch.exp(k)) * arcosh(d / torch.exp(k))
 
 
 def project(x, *, k, dim=-1):
@@ -353,8 +353,8 @@ def expmap0(u, *, k, dim=-1):
 @torch.jit.script
 def _expmap0(u, k: torch.Tensor, dim: int = -1):
     nomin = _norm(u, keepdim=True, dim=dim)
-    l_v = torch.cosh(nomin / torch.sqrt(k)) * torch.sqrt(k)
-    r_v = torch.sqrt(k) * torch.sinh(nomin / torch.sqrt(k)) * u / nomin
+    l_v = torch.cosh(nomin / torch.sqrt(torch.exp(k))) * torch.sqrt(torch.exp(k))
+    r_v = torch.sqrt(torch.exp(k)) * torch.sinh(nomin / torch.sqrt(torch.exp(k))) * u / nomin
     dn = r_v.size(dim) - 1
     p = torch.cat((l_v + r_v.narrow(dim, 0, 1), r_v.narrow(dim, 1, dn)), dim)
     return p
@@ -430,7 +430,7 @@ def logmap0(y, *, k, dim=-1):
 @torch.jit.script
 def _logmap0(y, k, dim: int = -1):
     dist_ = _dist0(y, k=k, dim=dim, keepdim=True)
-    nomin_ = 1.0 / k * _inner0(y, k=k, keepdim=True) * torch.sqrt(k)
+    nomin_ = 1.0 / torch.exp(k) * _inner0(y, k=k, keepdim=True) * torch.sqrt(torch.exp(k))
     dn = y.size(dim) - 1
     nomin = torch.cat((nomin_ + y.narrow(dim, 0, 1), y.narrow(dim, 1, dn)), dim)
     denom = _norm(nomin, keepdim=True)

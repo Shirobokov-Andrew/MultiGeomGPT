@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.lmath import project, distance, norm
+from model.lmath import project, distance, norm, logmap0, expmap0
 from config.model_config import MultiGeomGPTConfig
 
 
@@ -385,10 +385,10 @@ class FullyHyperbolicBlock(nn.Module):
         self.rotary = Rotary(config.head_dim)
 
         self.mlp_expand = nn.Linear(config.n_embd + 1, 4 * config.n_embd + 3)
-        self.act = nn.ReLU()
+        self.act = nn.GELU()
         self.mlp_shrink = nn.Linear(4 * (config.n_embd + 1), config.n_embd)
 
-        # self.normalization = nn.LayerNorm(config.n_embd)
+        self.normalization = nn.LayerNorm(config.n_embd)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -397,8 +397,9 @@ class FullyHyperbolicBlock(nn.Module):
         if x.shape[-1] == self.config.n_embd:
             lx = project(x, k=self.block_curvature) # map euc/sph input to block hyperboloid (B, T, n_embd + 1)
         elif x.shape[-1] == self.config.n_embd + 1:
-            x_norm = norm(x, keepdim=True) # map hyp input x to block hyperboloid (B, T, n_embd + 1)
-            lx = x * torch.sqrt(torch.exp(self.block_curvature)) / x_norm
+            # x_norm = norm(x, keepdim=True) # map hyp input x to block hyperboloid (B, T, n_embd + 1)
+            # lx = x * torch.sqrt(torch.exp(self.block_curvature)) / x_norm
+            lx = x
         else:
             raise ValueError(f"input x has invalid vector dimension: {x.shape[-1]}")
 
@@ -454,9 +455,10 @@ class FullyHyperbolicBlock(nn.Module):
         """
         lx and f_lx are tensors from hyperboloid (B, T, n_embd + 1)
         """
-        skipped = lx + f_lx
-        skipped_norm = norm(skipped, keepdim=True)
-        skipped = skipped * torch.sqrt(torch.exp(self.block_curvature)) / skipped_norm
+        skipped = project(lx.narrow(-1, 1, lx.shape[-1] - 1) + f_lx.narrow(-1, 1, f_lx.shape[-1] - 1), k=self.block_curvature)
+        # skipped = expmap0(logmap0(lx, k=self.block_curvature) + logmap0(f_lx, k=self.block_curvature), k=self.block_curvature)
+        # skipped_norm = norm(skipped, keepdim=True)
+        # skipped = skipped * torch.sqrt(torch.exp(self.block_curvature)) / skipped_norm
 
         return skipped
     
@@ -479,8 +481,8 @@ class FullyHyperbolicBlock(nn.Module):
         lx is a tensor from hyperboloid (B, T, n_embd + 1)
         """
         lx = lx.narrow(-1, 1, lx.shape[-1] - 1)
-        lx = F.rms_norm(lx, (lx.size(-1),))
-        # lx_normed = self.normalization(lx_s)
+        # lx = F.rms_norm(lx, (lx.size(-1),))
+        lx = self.normalization(lx)
         lx = project(lx, k=self.block_curvature)
 
         return lx
@@ -580,7 +582,7 @@ class MultiGeometryGPT(nn.Module):
     def forward(self, idx: torch.Tensor, targets: torch.Tensor = None):
         x = self.transformer.wte(idx)
 
-        for i, block in enumerate(self.transformer.layers):
+        for block in self.transformer.layers:
             x = block(x)
         
         # if the last layer is fully hyperbolic we have to reduce dimension by 1 to get n_embd dimension
