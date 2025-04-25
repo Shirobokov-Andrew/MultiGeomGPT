@@ -430,7 +430,7 @@ class FullyHyperbolicBlock(nn.Module):
         mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=lq.device), diagonal=1)
         attn_bias.masked_fill_(mask, float('-inf'))
 
-        # attn matrix is an determined by the inverse geodesic distance on hyperboloid
+        # attn matrix is an determined by the inverse/negative geodesic distance on hyperboloid
         dis = distance(lq, lk, k=self.attn_curvatures) # (B, num_heads, T, T)
         if self.config.hyp_attn_weight == "inverse_dis":
             attn_weight = lq.shape[-1] ** (0.5) / (1e-6 + dis)
@@ -538,11 +538,12 @@ class MultiGeometryGPT(nn.Module):
 
         wte = nn.Embedding(config.vocab_size, config.n_embd)
 
+        layers_list = []
         if config.multi_geom_block:
-            layers = nn.ModuleList([MultiGeometryBlock(config) for _ in range(config.n_layers)])
+            layers_list = [MultiGeometryBlock(config) for _ in range(config.n_layers)]
+            layers = nn.ModuleList(layers_list)
         else:
             geom_dict = {"euc": config.n_euc_layers, "hyp": config.n_hyp_layers, "sph": config.n_sph_layers}
-            layers_list = []
             self.layers_geoms = []
 
             for geom_type in config.layers_order:
@@ -557,7 +558,7 @@ class MultiGeometryGPT(nn.Module):
             layers = nn.ModuleList(layers_list)
 
         self.transformer = nn.ModuleDict(dict(wte=wte, layers=layers))
-
+        
         if isinstance(layers_list[-1], FullyHyperbolicBlock):
             n_embd = config.n_embd + 1
         else:
