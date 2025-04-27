@@ -56,12 +56,19 @@ def create_run_id(train_config: TrainConfig, model_config: MultiGeomGPTConfig, d
     seconds_since_midnight = (timestamp - timestamp.replace(hour=0, minute=0, second=0, microsecond=0)).seconds
     
     # Get architecture configuration
-    head, n1, n2, n3 = mode_aliases[model_config.lm_head_mode], model_config.n1, model_config.n2, model_config.n3
-    arch = f"{head}{n1}{n2}{n3}"
+    if model_config.multi_geom_block:
+        head, n1, n2, n3 = mode_aliases[model_config.lm_head_mode], model_config.n1, model_config.n2, model_config.n3
+        arch = f"{head}{n1}{n2}{n3}"
+    else:
+        geom_dict = {"euc": model_config.n_euc_layers, "hyp": model_config.n_hyp_layers, "sph": model_config.n_sph_layers}
+        head = mode_aliases[model_config.lm_head_mode]
+        arch = f"{head}"
+        for geom in model_config.layers_order:
+            arch += f"_{geom[0]}{geom_dict[geom]}"
     
     # Build the hyperbolic parameters string if needed
     hyp_params = ""
-    if 'h' in arch:
+    if arch[0] == "h" or geom_dict["hyp"] > 0:
         hyp_params = f"_k{model_config.curvature}"
         if model_config.attn_k_lr:
             hyp_params += f"_attn_lr{model_config.attn_k_lr:.0e}"  # Using shorter scientific notation
