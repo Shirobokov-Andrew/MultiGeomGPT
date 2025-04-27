@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.lmath import project, distance, norm, logmap0, expmap0
+from model.lmath import project, distance, norm
 from config.model_config import MultiGeomGPTConfig
 
 
@@ -235,9 +235,10 @@ class JointGeometryAttention(nn.Module):
         super().__init__()
         self.config = config
         self.geom_type = geom_type
+        use_bias = False if geom_type == "sph" else True
 
-        self.qkv = nn.Linear(config.n_embd, 3 * config.head_dim * config.n_heads, bias=False)
-        self.out_proj = nn.Linear(config.head_dim * config.n_heads, config.n_embd, bias=False)
+        self.qkv = nn.Linear(config.n_embd, 3 * config.head_dim * config.n_heads, bias=use_bias)
+        self.out_proj = nn.Linear(config.head_dim * config.n_heads, config.n_embd, bias=use_bias)
         self.rotary = Rotary(config.head_dim)
 
         if geom_type == "hyp":
@@ -259,7 +260,7 @@ class JointGeometryAttention(nn.Module):
     
     def _init_spherical_params(self):
         self.sqk_init_value = 1.0
-        self.sqk_init_scaling = 1.0 / (self.config.config.n_embd ** 0.5)
+        self.sqk_init_scaling = 1.0 / (self.config.n_embd ** 0.5)
         self.sqk = nn.Parameter(self.sqk_init_scaling * torch.ones(self.config.n_embd, dtype=torch.float32))
 
     def forward(self, x: torch.Tensor):
@@ -491,12 +492,18 @@ class FullyHyperbolicBlock(nn.Module):
 class LorentzMLR(nn.Module):
     """ Multinomial logistic regression (MLR) in the Lorentz model"""
 
-    def __init__(self, head_k_lr: float, init_k: float, vocab_size: int, n_embd: int):
+    def __init__(self, head_k_lr: float, init_k: float, vocab_size: int, n_embd: int, do_project: bool = True):
         super().__init__()
+        
+        self.do_project = do_project
+        if do_project:
+            n_embd = n_embd + 1
+
         if head_k_lr > 0:
             self.k = nn.Parameter(torch.tensor(init_k))
         else:
             self.register_buffer('k', torch.tensor(init_k))
+
         self.a = torch.nn.Parameter(torch.zeros(vocab_size, ))  # optimize properly
         self.z = torch.nn.Parameter(F.pad(torch.zeros(vocab_size, n_embd - 2), pad=(1, 0), value=1)) # (vocab_size, n_embd-1)
 
@@ -506,7 +513,8 @@ class LorentzMLR(nn.Module):
         # x: (B, T, num_features)
 
         # Hyperplane parameters
-        # x = project(x, k=self.k)
+        if self.do_project:
+            x = project(x, k=self.k)
         sqrt_mK = 1 / self.k.sqrt()  # scalar
         norm_z = torch.norm(self.z, dim=-1)  # (vocab_size,)
         w_t = torch.sinh(sqrt_mK * self.a) * norm_z  # (vocab_size,)
@@ -568,7 +576,7 @@ class MultiGeometryGPT(nn.Module):
             self.lm_head = nn.Linear(n_embd, config.vocab_size)
             self._init_weights(self.lm_head)
         elif config.lm_head_mode == 'hyp':
-            self.lm_head = LorentzMLR(config.head_k_lr, config.curvature, config.vocab_size, n_embd)
+            self.lm_head = LorentzMLR(config.head_k_lr, config.curvature, config.vocab_size, config.n_embd, self.config.lm_head_do_project)
         elif config.lm_head_mode == 'sph':
             self.lm_head = nn.Linear(n_embd, config.vocab_size)
             self._init_weights(self.lm_head)
@@ -600,8 +608,13 @@ class MultiGeometryGPT(nn.Module):
             loss = None
 
         return logits, loss
-    
+
     def normalize_sph_matrices(self):
+        # if not self.config.multi_geom_block \
+        #     and ((self.config.n_sph_layers > 0 and not self.config.n_euc_layers and not self.config.n_hyp_layers) \
+        #     or (self.config.n_sph_layers > 0 and self.config.layers_order[0] == "sph")):
+        #     self.transformer.wte.weight.data.copy_(F.normalize(self.transformer.wte.weight.data, p=2.0, dim=-1))
+
         for layer in self.transformer.layers:
             if layer.geom_type == "sph":
                 layer.attn.qkv.weight.data.copy_(F.normalize(layer.attn.qkv.weight.data, p=2.0, dim=-1))
