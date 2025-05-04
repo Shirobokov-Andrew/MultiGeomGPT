@@ -489,6 +489,26 @@ class FullyHyperbolicBlock(nn.Module):
         return lx
 
 
+class SO1nLinear:
+    def __init__(self, config: MultiGeomGPTConfig):
+        super().__init__()
+        self.config = config
+        self.B = nn.Parameter(torch.randn(config.n_embd - 1, config.n_embd - 1) * 0.01)
+        eta = torch.diag(torch.tensor([-1.0] + [1.0] * config.n_embd))
+        self.register_buffer("eta", eta)
+        self.init_weights()
+    
+    def forward(self, lx: torch.Tensor) -> torch.Tensor:
+        a = self.eta @ (self.B - self.B.T)
+        so1n_matrix = torch.linalg.matrix_exp(a)
+
+        return lx @ so1n_matrix.T
+
+    def init_weights(self):
+        stdv = 1. / math.sqrt(1 + self.B.size(1))
+        nn.init.uniform_(self.B, -stdv, stdv)
+
+
 class LorentzMLR(nn.Module):
     """ Multinomial logistic regression (MLR) in the Lorentz model"""
 
